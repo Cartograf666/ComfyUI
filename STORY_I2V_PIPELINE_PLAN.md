@@ -4,6 +4,33 @@
 > Статус: только планирование, код позже.
 > Парный документ: `VIRAL_PIPELINE_PLAN.md`.
 
+## Статус реализации (на 2026-06-08)
+
+Реализовано коммитами `Baseline story I2V planning and workflow` → `Implement Story I2V pipeline plan` → `Finish Story I2V defaults and media polish`.
+
+| Пункт | Статус | Комментарий |
+|---|---|---|
+| S-1.1 commit baseline | ✅ | в гите |
+| S-1.2 регистрация нод | ✅ | все 17 типов графа зарегистрированы; `story_i2v_nodes_test.py`, `validate_story_i2v_with_comfy.py` |
+| S-1.3 canonical workflow | ✅ | `build_workflow.py` ↔ JSON синхронны |
+| S0.1–S0.4 Phase 0 харнесс | ✅ | `story_i2v_phase0_harness.py` + ledger (свип strength 0.1/0.3/0.5, модели, провайдеры) |
+| S1.1 единый провайдер | ✅ | `TEXT_API_PROVIDERS = (poyo, google_official, atlascloud)` |
+| S1.2 Atlas-пресеты + дефолты | ✅ | settings: provider=atlascloud, video_model=kling-v2.0, авто-коррекция model↔provider |
+| S1.3 судьба I2VTransition | ✅ | удалён из графа; FLF сделан через `image_2` |
+| S2.1 grid role + strength | ✅ | дефолт поднят 0.1 → **0.3** (`nodes_scene_parser.py:5218,5922`) |
+| S2.2 двойной референс | ✅ | `StoryCharacterSheetPromptNode` (identity) + панель (composition) |
+| S2.3 bible инжект | ✅ | через character-sheet reference-image |
+| S2.4 negative passthrough | ✅ | проброшен в image/video |
+| S3.1 озвучка + timing | ✅ | 8× `ViralSceneAudioProcessorNode` (EdgeTTS) + `StoryNarrationPackNode` → длительность гонит длину видео |
+| S3.2 video-промпт под модель | ✅ | `STORY_VIDEO_PROMPT_PRESETS` (kling/seedance/generic) |
+| S3.3 FLF-континьюити | ✅ | `image_1`=кадр N, `image_2`=кадр N+1 как last-frame |
+| S3.4 переходы/музыка | ✅ | `background_music` + volume 0.08 в `VideoConcat8` (ffmpeg `amix`) |
+| P3 конвергенция с Viral | ⬜ | поздняя фаза, не начато |
+
+**⚠️ Единственный содержательный остаток — Phase 0 не выполнен:** 0/36 строк ledger оценены (`human_score=null`, `outputs={}`). То есть `strength=0.3`, `kling-v2.0`, `flux-pro` — это разумные дефолты-догадки, а не измеренный оптимум. Машинерия готова; нужно прогнать золотой тест-кейс и проставить оценки.
+
+**Опц. полиш:** S3.4 — музыка через `amix` на фикс-громкости 0.08, не сайдчейн-дакинг; настоящий ducking при желании отдельной задачей.
+
 ## Что это и чем отличается
 
 Story I2V — самый молодой, но **архитектурно самый правильный** из трёх пайплайнов:
