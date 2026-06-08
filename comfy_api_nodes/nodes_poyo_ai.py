@@ -8,13 +8,17 @@ Upload:  POST https://api.poyo.ai/api/common/upload/base64
 
 import asyncio
 import hashlib
+import random
 
 import aiohttp
 
 try:
-    from comfy_api_nodes.nodes_scene_parser import log_usage
+    from comfy_api_nodes.nodes_scene_parser import log_seed, log_usage
 except ImportError:
     def log_usage(*args, **kwargs):  # graceful no-op if scene_parser isn't loaded
+        pass
+
+    def log_seed(*args, **kwargs):  # graceful no-op if scene_parser isn't loaded
         pass
 
 from comfy_api.latest import IO, ComfyExtension
@@ -107,6 +111,132 @@ async def _upload_image_to_poyo(api_key: str, tensor) -> str:
     return url
 
 
+_ATLAS_UPLOAD_CACHE: dict[str, str] = {}
+
+
+async def _upload_image_to_atlas(api_key: str, tensor) -> str:
+    fp = _tensor_fingerprint(tensor)
+    cached = _ATLAS_UPLOAD_CACHE.get(fp)
+    if cached:
+        return cached
+
+    import io
+    from PIL import Image as PILImage
+    import numpy as np
+
+    img = tensor[0] if tensor.dim() == 4 else tensor
+    if img.shape[-1] == 4:
+        img = img[..., :3]
+    arr = (img.cpu().numpy() * 255.0).clip(0, 255).astype("uint8")
+    pil = PILImage.fromarray(arr)
+    
+    bio = io.BytesIO()
+    pil.save(bio, format="PNG")
+    bio.seek(0)
+
+    data = aiohttp.FormData()
+    data.add_field("file", bio, filename="image.png", content_type="image/png")
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    upload_url = "https://api.atlascloud.ai/api/v1/model/uploadMedia"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            upload_url,
+            data=data,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                raise Exception(
+                    f"Atlas Cloud AI image upload failed (HTTP {resp.status}): {err[:300]}"
+                )
+            res_data = await resp.json()
+
+    url = res_data.get("url")
+    if not url:
+        raise Exception(f"Atlas Cloud AI upload returned no url in response: {str(res_data)[:300]}")
+
+    _ATLAS_UPLOAD_CACHE[fp] = url
+    return url
+
+
+async def _submit_and_poll_atlas(
+    api_key: str,
+    submit_url: str,
+    payload: dict,
+    estimated_duration: int = 60
+) -> list[str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(submit_url, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                raise Exception(f"Atlas Cloud AI submit failed (HTTP {resp.status}): {err[:300]}")
+            res_data = await resp.json()
+            
+    data_section = res_data.get("data", {})
+    prediction_id = None
+    if isinstance(data_section, dict):
+        prediction_id = data_section.get("id") or data_section.get("prediction_id")
+    if not prediction_id:
+        prediction_id = res_data.get("id") or res_data.get("prediction_id")
+        
+    if not prediction_id:
+        raise Exception(f"Atlas Cloud AI submit response missing ID: {str(res_data)[:300]}")
+        
+    poll_url = f"https://api.atlascloud.ai/api/v1/model/prediction/{prediction_id}"
+    poll_interval = 5.0
+    elapsed = 0.0
+    max_timeout = max(300.0, float(estimated_duration * 3))
+    
+    while elapsed < max_timeout:
+        try:
+            from comfy_api_nodes.util._helpers import sleep_with_interrupt
+            await sleep_with_interrupt(poll_interval, None, None, None, None)
+        except (ImportError, Exception):
+            await asyncio.sleep(poll_interval)
+            
+        elapsed += poll_interval
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(poll_url, headers=headers) as resp:
+                if resp.status != 200:
+                    print(f"[Atlas Cloud] Status check warning (HTTP {resp.status})", flush=True)
+                    continue
+                poll_data = await resp.json()
+                
+        data_sec = poll_data.get("data", {})
+        if not isinstance(data_sec, dict):
+            data_sec = poll_data
+            
+        status = (data_sec.get("status") or "").strip().lower()
+        print(f"[Atlas Cloud] Task {prediction_id} status: {status} (elapsed: {int(elapsed)}s)", flush=True)
+        
+        if status == "completed":
+            outputs = data_sec.get("outputs")
+            if not outputs:
+                outputs = data_sec.get("output") or poll_data.get("outputs") or poll_data.get("output")
+            if isinstance(outputs, str):
+                outputs = [outputs]
+            if not outputs:
+                raise Exception(f"Atlas Cloud AI task completed but returned no outputs: {str(poll_data)[:300]}")
+            return outputs
+            
+        if status in ("failed", "error", "cancelled"):
+            error_msg = data_sec.get("error_message") or data_sec.get("error") or "Unknown error"
+            raise Exception(f"Atlas Cloud AI task {status}: {error_msg}")
+            
+    raise Exception(f"Atlas Cloud AI task timed out after {int(elapsed)} seconds.")
+
+
 def _status_url(task_id: str) -> str:
     return f"https://api.poyo.ai/api/generate/status/{task_id}"
 
@@ -155,6 +285,61 @@ async def _submit_and_poll(
     )
 
 
+def _is_moderation_error(exc: Exception) -> bool:
+    """True when a task failed because Poyo's content filter rejected it.
+
+    Poyo's moderation is probabilistic — the SAME prompt/reference is sometimes
+    accepted and sometimes rejected — so these failures are worth retrying.
+    """
+    msg = str(exc).lower()
+    return (
+        "does not comply" in msg
+        or "platform regulation" in msg
+        or ("content" in msg and "regulation" in msg)
+    )
+
+
+async def _submit_and_poll_retry(
+    cls: type[IO.ComfyNode],
+    api_key: str,
+    request: PoyoSubmitRequest,
+    estimated_duration: int,
+    max_attempts: int = 3,
+) -> PoyoStatusResponse:
+    """Like _submit_and_poll, but retries flaky content-moderation rejections.
+
+    Each retry uses a fresh random seed so it is a genuinely new generation (a new
+    roll of the probabilistic filter), which clears the rejection the vast majority
+    of the time. Non-moderation errors are raised immediately. If every attempt is
+    rejected, raises a clear, actionable message instead of the raw API dump.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await _submit_and_poll(cls, api_key, request, estimated_duration)
+        except Exception as exc:
+            if not _is_moderation_error(exc):
+                raise
+            if attempt < max_attempts:
+                new_seed = random.randint(1, 2_147_483_647)
+                try:
+                    request.input.seed = new_seed
+                except Exception:
+                    pass
+                print(
+                    f"[Poyo] content moderation rejection (attempt {attempt}/{max_attempts}); "
+                    f"retrying with seed={new_seed} — Poyo's filter is flaky.",
+                    flush=True,
+                )
+                await asyncio.sleep(1.5)
+                continue
+            raise Exception(
+                f"Poyo content moderation rejected this generation on all {max_attempts} attempts. "
+                "Poyo's filter is flaky, but persistent rejection usually means the prompt itself "
+                "trips it — tweak the wording (avoid graphic/violent terms) and re-run. "
+                f"Last API error: {exc}"
+            ) from exc
+
+
 class PoyoAIImageNode(IO.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -171,7 +356,14 @@ class PoyoAIImageNode(IO.ComfyNode):
                     "api_key",
                     multiline=False,
                     default="",
-                    tooltip="Your Poyo AI API key. Keep this private!",
+                    optional=True,
+                    tooltip="Your API key. Optional if using environment variable.",
+                ),
+                IO.Combo.Input(
+                    "api_provider",
+                    options=["poyo", "atlascloud"],
+                    default="poyo",
+                    tooltip="Select the API provider: Poyo AI or Atlas Cloud AI.",
                 ),
                 IO.String.Input(
                     "model",
@@ -180,7 +372,8 @@ class PoyoAIImageNode(IO.ComfyNode):
                     tooltip=(
                         "Model to use. Available: gpt-image-2 (text→image), "
                         "gpt-image-2-edit (image→image with reference). "
-                        "Edit mode activates automatically when reference_image is connected."
+                        "Edit mode activates automatically when reference_image is connected. "
+                        "For Atlas Cloud, type the desired model path here, e.g. 'black-forest-labs/flux-1-schnell'."
                     ),
                 ),
                 IO.String.Input(
@@ -218,7 +411,23 @@ class PoyoAIImageNode(IO.ComfyNode):
                 IO.Image.Input(
                     "reference_image",
                     optional=True,
-                    tooltip="Optional reference image. When connected, switches to gpt-image-2-edit mode.",
+                    tooltip=(
+                        "Optional reference image (e.g. a character sheet for identity consistency). "
+                        "When connected, switches to edit mode. Can be combined with "
+                        "base_scene_image to lock both environment and characters."
+                    ),
+                ),
+                # Declared AFTER reference_image so adding it never shifts reference_image's slot
+                # index in pre-existing graphs (viral/asmr pipelines) that already wire reference_image.
+                IO.Image.Input(
+                    "base_scene_image",
+                    optional=True,
+                    tooltip=(
+                        "Optional base-scene / establishing-plate image (environment + camera angle). "
+                        "Locked as the primary canvas so a chunk's scenes keep an identical background "
+                        "while only foreground characters/objects change. When connected, switches to "
+                        "edit mode."
+                    ),
                 ),
                 IO.Float.Input(
                     "image_prompt_strength",
@@ -226,7 +435,10 @@ class PoyoAIImageNode(IO.ComfyNode):
                     min=0.0,
                     max=1.0,
                     step=0.01,
-                    tooltip="How strongly the reference image influences the output (edit mode only).",
+                    tooltip=(
+                        "How strongly the reference image(s) influence the output (edit mode only). "
+                        "Applies to the whole edit request."
+                    ),
                     advanced=True,
                 ),
             ],
@@ -244,27 +456,70 @@ class PoyoAIImageNode(IO.ComfyNode):
         resolution: str,
         seed: int,
         image_prompt_strength: float = 0.1,
+        base_scene_image=None,
         reference_image=None,
+        api_provider: str = "poyo",
     ) -> IO.NodeOutput:
-        validate_string(api_key, strip_whitespace=True, min_length=1, field_name="api_key")
         if not prompt.strip():
+            print("[PoyoAIImageNode] Image generation skipped because prompt is empty.", flush=True)
+            return IO.NodeOutput(block_execution=None)
+
+        # Resolve/share API key
+        import os
+        key = api_key.strip()
+        if not key:
+            key = os.getenv("POYO_API_KEY", "").strip() or os.getenv("ATLAS_API_KEY", "").strip()
+        if not key:
             raise ValueError(
-                "Image prompt is empty — the SceneParser may have returned an empty string. "
-                "Check that the script-writing Gemini node produced a correctly formatted 6-scene script "
-                "(each scene must have an 'Image Prompt:' line)."
+                "Poyo/Atlas API Key is missing. Enter it in the node input, "
+                "or set the POYO_API_KEY or ATLAS_API_KEY environment variable."
             )
+        os.environ["POYO_API_KEY"] = key
+        api_key = key
         validate_string(prompt, strip_whitespace=True, min_length=1, field_name="prompt")
+
+        if api_provider == "atlascloud":
+            submit_url = "https://api.atlascloud.ai/api/v1/model/generateImage"
+            image_urls: list[str] | None = None
+            refs = [t for t in (base_scene_image, reference_image) if t is not None]
+            if refs:
+                image_urls = [await _upload_image_to_atlas(api_key, t) for t in refs]
+            
+            effective_seed = seed if seed > 0 else random.randint(1, 2147483647)
+            payload = {
+                "model": model.strip(),
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+                "size": aspect_ratio,
+                "seed": effective_seed,
+            }
+            if image_urls:
+                payload["image"] = image_urls[0]
+                payload["image_url"] = image_urls[0]
+                payload["image_urls"] = image_urls
+                payload["image_strength"] = image_prompt_strength
+                
+            outputs = await _submit_and_poll_atlas(api_key, submit_url, payload, estimated_duration=60)
+            return IO.NodeOutput(await download_url_to_image_tensor(outputs[0]))
 
         image_urls: list[str] | None = None
         effective_model = model.strip() or "gpt-image-2"
 
-        if reference_image is not None:
+        # Reference images, in request order: the base scene (establishing plate) is the primary
+        # canvas to edit, the character sheet follows as an identity reference. Either may be absent.
+        refs = [t for t in (base_scene_image, reference_image) if t is not None]
+        if refs:
             if "edit" not in effective_model:
                 effective_model = "gpt-image-2-edit"
-            # Poyo's submit endpoint requires http(s) URLs — upload first.
-            ref_url = await _upload_image_to_poyo(api_key, reference_image)
-            image_urls = [ref_url]
+            # Poyo's submit endpoint requires http(s) URLs — upload each first.
+            # _upload_image_to_poyo caches by content hash, so a per-chunk plate reused across
+            # scenes is uploaded only once.
+            image_urls = [await _upload_image_to_poyo(api_key, t) for t in refs]
 
+        # Resolve the seed client-side so the EXACT seed sent to Poyo is always known and
+        # recordable — even a seed=0 ("random") run becomes reproducible, because we capture
+        # what we actually sent instead of letting the server pick an unknowable seed.
+        effective_seed = seed if seed > 0 else random.randint(1, 2147483647)
         request = PoyoSubmitRequest(
             model=effective_model,
             input=PoyoSubmitInput(
@@ -272,17 +527,21 @@ class PoyoAIImageNode(IO.ComfyNode):
                 quality=quality,
                 size=aspect_ratio,
                 resolution=resolution,
-                seed=seed if seed > 0 else None,
+                seed=effective_seed,
                 image_urls=image_urls,
                 image_strength=image_prompt_strength if image_urls else None,
             ),
         )
-        result = await _submit_and_poll(cls, api_key, request, estimated_duration=60)
+        result = await _submit_and_poll_retry(cls, api_key, request, estimated_duration=60)
 
         if not result.data.files:
             raise Exception(f"Poyo AI returned no files. status={result.data.status}, error={result.data.error_message}")
 
-        log_usage("image", cache_hit=False, model=effective_model, resolution=resolution, quality=quality)
+        # request.input.seed reflects the seed of the SUCCESSFUL generation — a moderation
+        # retry replaces it with a fresh seed, so read it back rather than trusting effective_seed.
+        final_seed = request.input.seed
+        log_usage("image", cache_hit=False, model=effective_model, resolution=resolution, quality=quality, seed=final_seed)
+        log_seed("image", model=effective_model, seed=final_seed, resolution=resolution, quality=quality)
         return IO.NodeOutput(await download_url_to_image_tensor(result.data.files[0].file_url))
 
 
@@ -298,6 +557,13 @@ _VIDEO_MODELS = [
     # ByteDance Seedance 2
     "seedance-2-fast",
     "seedance-2",
+    # Atlas Cloud models
+    "kling-v2.0",
+    "kling-v1.5",
+    "luma-ray-v2",
+    "luma-ray-v1",
+    "runway-gen3",
+    "hailuo-v1.5",
 ]
 
 
@@ -327,13 +593,20 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
                     "api_key",
                     multiline=False,
                     default="",
-                    tooltip="Your Poyo AI API key (poyo.ai/dashboard/api-key). Keep this private!",
+                    optional=True,
+                    tooltip="Your API key. Optional if using environment variable.",
+                ),
+                IO.Combo.Input(
+                    "api_provider",
+                    options=["poyo", "atlascloud"],
+                    default="poyo",
+                    tooltip="Select the API provider: Poyo AI or Atlas Cloud AI.",
                 ),
                 IO.String.Input(
                     "prompt",
                     multiline=True,
                     default="",
-                    tooltip="Describe the video you want to generate (max 1000 chars for VEO).",
+                    tooltip="Describe the video you want to generate.",
                 ),
                 IO.Combo.Input(
                     "model",
@@ -345,7 +618,8 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
                         "• veo3.1-fast-official / quality-official — more features, costlier\n"
                         "• veo3.1-lite — TEXT ONLY (no image refs), 8s fixed, 720p+\n"
                         "• seedance-2-fast — 4–15s, 480p/720p, image-to-video OK\n"
-                        "• seedance-2 — 4–15s up to 1080p"
+                        "• seedance-2 — 4–15s up to 1080p\n"
+                        "For Atlas Cloud, type the desired model path here, e.g. 'kling-v2.0'."
                     ),
                 ),
                 IO.Combo.Input(
@@ -434,8 +708,20 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
         images: IO.Autogrow.Type = None,
         video_1=None,
         audio_1=None,
+        api_provider: str = "poyo",
     ) -> IO.NodeOutput:
-        validate_string(api_key, strip_whitespace=True, min_length=1, field_name="api_key")
+        # Resolve/share API key
+        import os
+        key = api_key.strip()
+        if not key:
+            key = os.getenv("POYO_API_KEY", "").strip() or os.getenv("ATLAS_API_KEY", "").strip()
+        if not key:
+            raise ValueError(
+                "Poyo/Atlas API Key is missing. Enter it in the node input, "
+                "or set the POYO_API_KEY or ATLAS_API_KEY environment variable."
+            )
+        os.environ["POYO_API_KEY"] = key
+        api_key = key
         if not prompt.strip():
             raise ValueError(
                 "Video prompt is empty — the SceneParser may have returned an empty string. "
@@ -443,6 +729,36 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
                 "(each scene must have a 'Video Prompt:' line)."
             )
         validate_string(prompt, strip_whitespace=True, min_length=1, field_name="prompt")
+
+        if api_provider == "atlascloud":
+            submit_url = "https://api.atlascloud.ai/api/v1/model/generateVideo"
+            image_urls: list[str] | None = None
+            if images:
+                tensors = [t for t in images.values() if t is not None]
+                if tensors:
+                    image_urls = [await _upload_image_to_atlas(api_key, t) for t in tensors]
+            
+            effective_seed = seed if seed > 0 else random.randint(1, 2147483647)
+            payload = {
+                "model": model.strip(),
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+                "size": aspect_ratio,
+                "seed": effective_seed,
+                "duration": duration,
+            }
+            if image_urls:
+                payload["image"] = image_urls[0]
+                payload["image_url"] = image_urls[0]
+                payload["image_urls"] = image_urls
+                if len(image_urls) >= 2:
+                    payload["first_frame"] = image_urls[0]
+                    payload["last_frame"] = image_urls[1]
+                    payload["start_image"] = image_urls[0]
+                    payload["end_image"] = image_urls[1]
+            
+            outputs = await _submit_and_poll_atlas(api_key, submit_url, payload, estimated_duration=duration * 20)
+            return IO.NodeOutput(await download_url_to_video_output(outputs[0]))
 
         # Per-model validation — fail fast with a useful message instead of burning credits on a 400.
         if _is_veo(model):
@@ -488,13 +804,18 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
                     url = await _upload_image_to_poyo(api_key, tensor)
                     image_urls.append(url)
 
+        # Resolve the seed client-side so the EXACT seed sent to Poyo is always known and
+        # recordable — even a seed=0 ("random") run becomes reproducible, because we capture
+        # what we actually sent instead of letting the server pick an unknowable seed.
+        effective_seed = seed if seed > 0 else random.randint(1, 2147483647)
+
         # VEO official uses `sound`; Seedance uses `generate_audio`. Send only the relevant key.
         input_kwargs = dict(
             prompt=prompt,
             resolution=resolution,
             duration=duration,
             aspect_ratio=aspect_ratio,
-            seed=seed if seed > 0 else None,
+            seed=effective_seed,
             image_urls=image_urls,
         )
         if _is_veo(model):
@@ -510,14 +831,18 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
             model=model,
             input=PoyoSubmitInput(**input_kwargs),
         )
-        result = await _submit_and_poll(
+        result = await _submit_and_poll_retry(
             cls, api_key, request, estimated_duration=duration * 20
         )
 
         if not result.data.files:
             raise Exception(f"Poyo AI returned no files. status={result.data.status}, error={result.data.error_message}")
 
-        log_usage("video", cache_hit=False, model=model, resolution=resolution, duration=duration)
+        # request.input.seed reflects the seed of the SUCCESSFUL generation — a moderation
+        # retry replaces it with a fresh seed, so read it back rather than trusting effective_seed.
+        final_seed = request.input.seed
+        log_usage("video", cache_hit=False, model=model, resolution=resolution, duration=duration, seed=final_seed)
+        log_seed("video", model=model, seed=final_seed, resolution=resolution, duration=duration)
         return IO.NodeOutput(await download_url_to_video_output(result.data.files[0].file_url))
 
 
