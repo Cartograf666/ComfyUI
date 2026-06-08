@@ -14,6 +14,9 @@ args.cpu = True
 
 import custom_nodes.comfyui_story_i2v as story
 from comfy_api_nodes.nodes_scene_parser import _processor_cache_fingerprint
+from comfy_api_nodes.nodes_scene_parser import StorySceneVideoProcessorNode
+from comfy_api_nodes.nodes_scene_parser import StoryboardGridProcessorNode
+from comfy_api_nodes.nodes_scene_parser import ViralSceneImageProcessorNode
 
 
 def _script_json():
@@ -74,8 +77,22 @@ def test_story_prompt_pack_injects_bible_negative_and_model_hints(monkeypatch, t
 
     assert "Character identity bible: Robot A has a silver body" in image_prompt
     assert "Avoid: deformed limbs, warped face" in image_prompt
-    assert "Kling I2V instructions" in video_prompt
+    assert "Kling I2V preset" in video_prompt
     assert "Avoid: deformed limbs, warped face" in grid_prompt
+
+
+def test_story_video_prompt_seedance_uses_named_preset():
+    prompt = story._model_video_prompt(
+        prompt="Robot crosses the corridor.",
+        video_model="seedance-2",
+        global_style="cinematic",
+        character_bible="Robot A has a silver body",
+        negative_prompt="identity drift",
+    )
+
+    assert "Seedance I2V preset" in prompt
+    assert "START, ACTION, END, CAMERA" in prompt
+    assert "Avoid: identity drift" in prompt
 
 
 def test_story_narration_pack_extracts_ru_and_estimates_duration():
@@ -119,3 +136,29 @@ def test_processor_cache_fingerprint_includes_settings_when_explicit_missing():
     assert "story_scene_video" in fp
     assert "kling-v2.0" in fp
     assert _processor_cache_fingerprint("story_scene_video", "explicit", model="x") == "explicit"
+
+
+def _schema_inputs(node_cls):
+    return {item.id: item for item in node_cls.define_schema().inputs}
+
+
+def test_story_i2v_processor_defaults_are_practical_not_phase0_placeholders():
+    scene_image = _schema_inputs(ViralSceneImageProcessorNode)
+    grid = _schema_inputs(StoryboardGridProcessorNode)
+    video = _schema_inputs(StorySceneVideoProcessorNode)
+
+    assert scene_image["api_provider"].default == "atlascloud"
+    assert scene_image["model"].default == "black-forest-labs/flux-1-dev"
+    assert scene_image["image_prompt_strength"].default == 0.3
+    assert grid["api_provider"].default == "atlascloud"
+    assert grid["model"].default == "black-forest-labs/flux-1-dev"
+    assert grid["image_prompt_strength"].default == 0.3
+    assert video["api_provider"].default == "atlascloud"
+    assert video["model"].default == "kling-v2.0"
+
+
+def test_story_concat_supports_optional_background_music():
+    inputs = {item.id: item for item in story.VideoConcat8FFmpegNode.define_schema().inputs}
+
+    assert "background_music" in inputs
+    assert inputs["background_music_volume"].default == 0.08

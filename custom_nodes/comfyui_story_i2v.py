@@ -44,6 +44,22 @@ GOOGLE_GEMINI_MODEL_ALIASES = {
     "gemini-3.1-flash-lite": "gemini-2.5-flash-lite",
     "gemini-2.5-flash-light": "gemini-2.5-flash-lite",
 }
+STORY_VIDEO_PROMPT_PRESETS = {
+    "kling": (
+        "Kling I2V preset: preserve the input frame identity, costume, background, lens, "
+        "and composition; use one clean physical action with natural subject motion; "
+        "keep the camera stable or use a slow cinematic push/pan; no sudden cuts, no scene reset"
+    ),
+    "seedance": (
+        "Seedance I2V preset: write START, ACTION, END, CAMERA, and ATMOSPHERE beats clearly; "
+        "keep movement simple, continuous, first-frame faithful, and readable within the clip duration; "
+        "avoid over-complex choreography"
+    ),
+    "generic": (
+        "Generic I2V preset: preserve identity, costume, environment, lighting, and camera continuity; "
+        "use continuous motion only; avoid abrupt edits and impossible limb motion"
+    ),
+}
 
 def _safe_cache_name(value, default="story_script_8"):
     text = (value or default).strip() or default
@@ -107,20 +123,11 @@ def _model_video_prompt(prompt, video_model, global_style, character_bible, nega
     text = _append_if_missing(prompt, "Global style", global_style)
     text = _append_if_missing(text, "Character continuity", character_bible)
     if "kling" in model:
-        preset = (
-            "Kling I2V instructions: preserve the input frame identity and composition; "
-            "use one clean physical action, natural subject motion, stable camera, no sudden cuts"
-        )
+        preset = STORY_VIDEO_PROMPT_PRESETS["kling"]
     elif "seedance" in model:
-        preset = (
-            "Seedance I2V instructions: describe start, action, end, and camera explicitly; "
-            "keep motion simple, continuous, and first-frame faithful"
-        )
+        preset = STORY_VIDEO_PROMPT_PRESETS["seedance"]
     else:
-        preset = (
-            "I2V instructions: preserve identity, costume, environment, and camera continuity; "
-            "avoid abrupt edits and impossible limb motion"
-        )
+        preset = STORY_VIDEO_PROMPT_PRESETS["generic"]
     text = _join_prompt_parts(text, preset + ".")
     return _append_if_missing(text, "Avoid", negative_prompt)
 
@@ -1273,6 +1280,8 @@ class VideoConcat8FFmpegNode(IO.ComfyNode):
                 IO.AnyType.Input("audio_6", optional=True),
                 IO.AnyType.Input("audio_7", optional=True),
                 IO.AnyType.Input("audio_8", optional=True),
+                IO.AnyType.Input("background_music", optional=True),
+                IO.Float.Input("background_music_volume", default=0.08, min=0.0, max=1.0, step=0.01),
                 IO.String.Input("filename_prefix", default="story_i2v_final"),
                 IO.Combo.Input("mode", options=["stream copy (fast)", "re-encode (compatible)"], default="stream copy (fast)"),
                 IO.Combo.Input("subtitles", options=["off", "burned in only"], default="off"),
@@ -1292,6 +1301,7 @@ class VideoConcat8FFmpegNode(IO.ComfyNode):
     @classmethod
     async def execute(cls, video_1=None, video_2=None, video_3=None, video_4=None, video_5=None, video_6=None, video_7=None, video_8=None,
                       audio_1=None, audio_2=None, audio_3=None, audio_4=None, audio_5=None, audio_6=None, audio_7=None, audio_8=None,
+                      background_music=None, background_music_volume=0.08,
                       filename_prefix="story_i2v_final", mode="stream copy (fast)", subtitles="off",
                       subtitle_text_1="", subtitle_text_2="", subtitle_text_3="", subtitle_text_4="",
                       subtitle_text_5="", subtitle_text_6="", subtitle_text_7="", subtitle_text_8="",
@@ -1307,6 +1317,27 @@ class VideoConcat8FFmpegNode(IO.ComfyNode):
         # Use system ffmpeg path or standard command name
         ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
         ffprobe_bin = shutil.which("ffprobe") or "ffprobe"
+
+        def write_audio_input(audio, path: str) -> str:
+            if isinstance(audio, str):
+                return audio
+            waveform = audio["waveform"]
+            if waveform.dim() == 3:
+                waveform = waveform[0]
+            waveform = waveform.detach().cpu()
+            if waveform.dim() == 1:
+                waveform = waveform.unsqueeze(0)
+
+            import wave
+            samples = waveform.transpose(0, 1).numpy()
+            samples = np.clip(samples, -1.0, 1.0)
+            pcm = (samples * 32767.0).astype(np.int16)
+            with wave.open(path, "wb") as wav:
+                wav.setnchannels(pcm.shape[1])
+                wav.setsampwidth(2)
+                wav.setframerate(int(audio["sample_rate"]))
+                wav.writeframes(pcm.tobytes())
+            return path
 
         scene_pairs = [
             (video_1, audio_1), (video_2, audio_2), (video_3, audio_3), (video_4, audio_4),
@@ -1360,30 +1391,7 @@ class VideoConcat8FFmpegNode(IO.ComfyNode):
 
                 # If audio is present, merge it with video, else keep silent track
                 if scene_audio is not None:
-                    if isinstance(scene_audio, str):
-                        audio_file_path = scene_audio
-                    else:
-                        # Write wav file to disk
-                        audio_wav_path = os.path.join(tmpdir, f"audio_{idx}.wav")
-
-                        # Convert tensor to wav
-                        waveform = scene_audio["waveform"]
-                        if waveform.dim() == 3:
-                            waveform = waveform[0]
-                        waveform = waveform.detach().cpu()
-                        if waveform.dim() == 1:
-                            waveform = waveform.unsqueeze(0)
-
-                        import wave
-                        samples = waveform.transpose(0, 1).numpy()
-                        samples = np.clip(samples, -1.0, 1.0)
-                        pcm = (samples * 32767.0).astype(np.int16)
-                        with wave.open(audio_wav_path, "wb") as wav:
-                            wav.setnchannels(pcm.shape[1])
-                            wav.setsampwidth(2)
-                            wav.setframerate(int(scene_audio["sample_rate"]))
-                            wav.writeframes(pcm.tobytes())
-                        audio_file_path = audio_wav_path
+                    audio_file_path = write_audio_input(scene_audio, os.path.join(tmpdir, f"audio_{idx}.wav"))
 
                     # Merge audio & video together
                     merged_p = os.path.join(tmpdir, f"clip_audio_{idx}.mp4")
@@ -1414,6 +1422,38 @@ class VideoConcat8FFmpegNode(IO.ComfyNode):
                 out_path
             ]
             run_ffmpeg(concat_cmd, "FFmpeg video concatenation")
+
+            if background_music is not None and float(background_music_volume) > 0:
+                music_path = write_audio_input(background_music, os.path.join(tmpdir, "background_music.wav"))
+                mixed_path = os.path.join(full_folder, f"{filename}_{counter:05d}_music.mp4")
+                audio_probe = subprocess.run(
+                    [
+                        ffprobe_bin, "-v", "error", "-select_streams", "a",
+                        "-show_entries", "stream=index", "-of", "csv=p=0", out_path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                has_audio = bool(audio_probe.stdout.strip())
+                volume = max(0.0, min(1.0, float(background_music_volume)))
+                if has_audio:
+                    filter_complex = (
+                        f"[1:a]volume={volume}[music];"
+                        "[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[a]"
+                    )
+                else:
+                    filter_complex = f"[1:a]volume={volume}[a]"
+                music_cmd = [
+                    ffmpeg_bin, "-y",
+                    "-i", out_path,
+                    "-stream_loop", "-1", "-i", music_path,
+                    "-filter_complex", filter_complex,
+                    "-map", "0:v", "-map", "[a]",
+                    "-c:v", "copy", "-c:a", "aac", "-shortest",
+                    mixed_path,
+                ]
+                run_ffmpeg(music_cmd, "FFmpeg background music mix")
+                shutil.move(mixed_path, out_path)
 
         print(f"[VideoConcat8] Successfully generated final stitched video: {out_path}")
         return IO.NodeOutput(InputImpl.VideoFromFile(out_path))

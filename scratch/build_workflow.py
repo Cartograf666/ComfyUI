@@ -567,6 +567,8 @@ concat = node(
     [
         *[inp(f"video_{i}", "VIDEO") for i in range(1, 9)],
         *[inp(f"audio_{i}", "AUDIO") for i in range(1, 9)],
+        inp("background_music", "AUDIO"),
+        inp("background_music_volume", "FLOAT", "background_music_volume"),
         inp("filename_prefix", "STRING", "filename_prefix"),
         inp("mode", "COMBO", "mode"),
         inp("subtitles", "COMBO", "subtitles"),
@@ -575,6 +577,7 @@ concat = node(
     ],
     [out("video", "VIDEO")],
     [
+        0.08,
         "story_i2v_final",
         "stream copy (fast)",
         "burned in only",
@@ -597,7 +600,7 @@ save = node(
 for i in range(1, 9):
     connect(video_gates[i - 1], 0, concat, i - 1, "VIDEO")
     connect(voiceovers[i - 1], 0, concat, 7 + i, "AUDIO")
-    connect(narration, i - 1, concat, 18 + i, "STRING")
+    connect(narration, i - 1, concat, 20 + i, "STRING")
 connect(concat, 0, save, 0, "VIDEO")
 
 
