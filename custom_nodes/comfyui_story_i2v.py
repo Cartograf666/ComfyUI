@@ -8,12 +8,22 @@ import shutil
 import torch
 import numpy as np
 from PIL import Image
+
+# Comfy may put <repo>/comfy before <repo> on sys.path while loading custom
+# nodes. Keep the project root ahead of it so imports like utils.install_util
+# resolve to the root package, not comfy/utils.py.
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root in sys.path:
+    sys.path.remove(project_root)
+sys.path.insert(0, project_root)
+import utils.install_util  # noqa: F401
+
 from comfy_execution.graph import ExecutionBlocker
 from typing_extensions import override
 from comfy_api.latest import IO, ComfyExtension, Input, InputImpl
 
 # Add hyperpipeline directory to sys.path to load local libraries
-hyperpipeline_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hyperpipeline")
+hyperpipeline_dir = os.path.join(project_root, "hyperpipeline")
 if hyperpipeline_dir not in sys.path:
     sys.path.append(hyperpipeline_dir)
 
@@ -27,7 +37,8 @@ output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 cache_dir = os.path.join(output_dir, "text_cache")
 os.makedirs(cache_dir, exist_ok=True)
 
-SHARED_API_KEYS = {"poyo": "", "google_official": ""}
+TEXT_API_PROVIDERS = ("poyo", "google_official", "atlascloud")
+SHARED_API_KEYS = {"poyo": "", "google_official": "", "atlascloud": ""}
 GOOGLE_GEMINI_MODEL_ALIASES = {
     "gemini-3.1-flash-light": "gemini-2.5-flash-lite",
     "gemini-3.1-flash-lite": "gemini-2.5-flash-lite",
@@ -70,6 +81,56 @@ def _fingerprint_text(*parts):
     joined = "\n\n".join(str(p or "") for p in parts)
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
+def _join_prompt_parts(*parts):
+    return " ".join(str(part or "").strip() for part in parts if str(part or "").strip()).strip()
+
+def _append_if_missing(prompt, label, value):
+    text = (prompt or "").strip()
+    value = (value or "").strip()
+    if not value:
+        return text
+    if value.lower() in text.lower():
+        return text
+    return _join_prompt_parts(text, f"{label}: {value}.")
+
+def _production_image_prompt(prompt, global_style, character_bible, negative_prompt):
+    text = _append_if_missing(prompt, "Global style", global_style)
+    text = _append_if_missing(text, "Character identity bible", character_bible)
+    text = _join_prompt_parts(
+        text,
+        "Use the storyboard panel as composition reference, but render a full-resolution final keyframe with high detail.",
+    )
+    return _append_if_missing(text, "Avoid", negative_prompt)
+
+def _model_video_prompt(prompt, video_model, global_style, character_bible, negative_prompt):
+    model = (video_model or "").strip().lower()
+    text = _append_if_missing(prompt, "Global style", global_style)
+    text = _append_if_missing(text, "Character continuity", character_bible)
+    if "kling" in model:
+        preset = (
+            "Kling I2V instructions: preserve the input frame identity and composition; "
+            "use one clean physical action, natural subject motion, stable camera, no sudden cuts"
+        )
+    elif "seedance" in model:
+        preset = (
+            "Seedance I2V instructions: describe start, action, end, and camera explicitly; "
+            "keep motion simple, continuous, and first-frame faithful"
+        )
+    else:
+        preset = (
+            "I2V instructions: preserve identity, costume, environment, and camera continuity; "
+            "avoid abrupt edits and impossible limb motion"
+        )
+    text = _join_prompt_parts(text, preset + ".")
+    return _append_if_missing(text, "Avoid", negative_prompt)
+
+def _estimate_narration_duration(text, min_seconds=4, max_seconds=15, padding_seconds=1.0, words_per_minute=145):
+    words = len([w for w in (text or "").replace("\n", " ").split(" ") if w.strip()])
+    if words <= 0:
+        return int(min_seconds)
+    seconds = (words / max(1, words_per_minute)) * 60.0 + float(padding_seconds)
+    return int(max(min_seconds, min(max_seconds, round(seconds))))
+
 def _read_cached_json(cache_name, fingerprint, mode, label):
     cache_path, metadata_path = _text_cache_paths(cache_name)
     cache_exists = os.path.exists(cache_path)
@@ -102,7 +163,7 @@ def _write_cached_json(cache_name, fingerprint, payload):
 
 def _resolve_story_api_key(api_provider, api_key):
     provider = (api_provider or "poyo").strip().lower()
-    if provider not in ("poyo", "google_official"):
+    if provider not in TEXT_API_PROVIDERS:
         provider = "poyo"
     if provider == "google_official":
         key = (
@@ -113,6 +174,19 @@ def _resolve_story_api_key(api_provider, api_key):
             or ""
         ).strip()
         missing = "Google/Gemini API key not found in env variables or inputs."
+    elif provider == "atlascloud":
+        key = (
+            api_key
+            or os.getenv("ATLAS_API_KEY")
+            or os.getenv("POYO_API_KEY")
+            or SHARED_API_KEYS["atlascloud"]
+            or SHARED_API_KEYS["poyo"]
+            or ""
+        ).strip()
+        missing = (
+            "Atlas/Poyo-compatible text API key not found. Story text generation currently "
+            "routes atlascloud text requests through the Poyo Gemini-compatible endpoint."
+        )
     else:
         key = (api_key or os.getenv("POYO_API_KEY") or SHARED_API_KEYS["poyo"] or "").strip()
         missing = "Poyo API key not found in env variables or inputs."
@@ -314,7 +388,7 @@ class StoryRuScriptGeneratorNode:
                 "scene_count": ("INT", {"default": 8, "min": 6, "max": 8, "step": 1}),
                 "api_key": ("STRING", {"default": "", "multiline": False}),
                 "model": ("STRING", {"default": "gemini-2.5-flash"}),
-                "api_provider": (["poyo", "google_official"], {"default": "poyo"}),
+                "api_provider": (list(TEXT_API_PROVIDERS), {"default": "poyo"}),
                 "project_slug": ("STRING", {"default": "robot_station_001"}),
                 "cache_mode": (["auto", "use cached", "regenerate"], {"default": "auto"}),
             }
@@ -416,9 +490,12 @@ class StoryEnPromptPackNode:
                 "approved_script_json": ("STRING", {"default": "", "multiline": True}),
                 "api_key": ("STRING", {"default": "", "multiline": False}),
                 "model": ("STRING", {"default": "gemini-2.5-flash"}),
-                "api_provider": (["poyo", "google_official"], {"default": "poyo"}),
+                "api_provider": (list(TEXT_API_PROVIDERS), {"default": "poyo"}),
                 "project_slug": ("STRING", {"default": "robot_station_001"}),
                 "cache_mode": (["auto", "use cached", "regenerate"], {"default": "auto"}),
+            },
+            "optional": {
+                "video_model": ("STRING", {"default": "auto"}),
             }
         }
 
@@ -439,12 +516,13 @@ class StoryEnPromptPackNode:
     FUNCTION = "translate"
     CATEGORY = "hyperpipeline/story_i2v"
 
-    def translate(self, approved_script_json, api_key, model, api_provider, project_slug, cache_mode):
+    def translate(self, approved_script_json, api_key, model, api_provider, project_slug, cache_mode, video_model="auto"):
         mode = (cache_mode or "auto").strip().lower()
         if mode not in ("auto", "use cached", "regenerate"):
             mode = "auto"
         model = _normalize_story_text_model(api_provider, model)
-        fingerprint = _fingerprint_text(approved_script_json, model, api_provider)
+        video_model = (video_model or "auto").strip()
+        fingerprint = _fingerprint_text(approved_script_json, model, api_provider, video_model)
         cache_name = _project_cache_name(project_slug, "en_prompt_pack")
 
         pack = None if mode == "regenerate" else _read_cached_json(cache_name, fingerprint, mode, "StoryEnPromptPack")
@@ -485,28 +563,138 @@ Rules:
         scenes = pack.get("scenes", [])
         image_prompts = [""] * 8
         video_prompts = [""] * 8
+        global_style = pack.get("global_style_prompt", "")
+        character_bible = pack.get("character_bible_en", "")
+        negative_prompt = pack.get("negative_prompt", "")
         for idx in range(8):
             if idx < len(scenes) and isinstance(scenes[idx], dict):
-                image_prompts[idx] = scenes[idx].get("image_prompt", "")
-                video_prompts[idx] = scenes[idx].get("video_prompt", "")
+                image_prompts[idx] = _production_image_prompt(
+                    scenes[idx].get("image_prompt", ""),
+                    global_style,
+                    character_bible,
+                    negative_prompt,
+                )
+                video_prompts[idx] = _model_video_prompt(
+                    scenes[idx].get("video_prompt", ""),
+                    video_model,
+                    global_style,
+                    character_bible,
+                    negative_prompt,
+                )
+                scenes[idx]["image_prompt"] = image_prompts[idx]
+                scenes[idx]["video_prompt"] = video_prompts[idx]
         storyboard_grid_prompt = pack.get("storyboard_grid_prompt", "")
         if not storyboard_grid_prompt:
             storyboard_grid_prompt = (
                 "Create one storyboard sheet with exactly 8 clearly separated numbered panels. "
-                f"Global style: {pack.get('global_style_prompt', '')}. "
-                f"Characters: {pack.get('character_bible_en', '')}. "
+                f"Global style: {global_style}. "
+                f"Characters: {character_bible}. "
                 + " ".join(f"Panel {i+1}: {p}" for i, p in enumerate(image_prompts) if p)
             ).strip()
+        storyboard_grid_prompt = _append_if_missing(storyboard_grid_prompt, "Avoid", negative_prompt)
         prompt_pack_json = json.dumps(pack, ensure_ascii=False, indent=2)
         return (
             prompt_pack_json,
             storyboard_grid_prompt,
             *image_prompts,
             *video_prompts,
-            pack.get("character_bible_en", ""),
-            pack.get("negative_prompt", ""),
+            character_bible,
+            negative_prompt,
             _fingerprint_text(prompt_pack_json),
         )
+
+
+class StoryNarrationPackNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "approved_script_json": ("STRING", {"default": "", "multiline": True}),
+                "min_scene_seconds": ("INT", {"default": 4, "min": 2, "max": 15, "step": 1}),
+                "max_scene_seconds": ("INT", {"default": 8, "min": 4, "max": 20, "step": 1}),
+                "padding_seconds": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.1}),
+                "words_per_minute": ("INT", {"default": 145, "min": 80, "max": 240, "step": 5}),
+            }
+        }
+
+    RETURN_TYPES = (
+        "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING",
+        "INT", "INT", "INT", "INT", "INT", "INT", "INT", "INT",
+        "STRING", "STRING",
+    )
+    RETURN_NAMES = (
+        "narration_1", "narration_2", "narration_3", "narration_4",
+        "narration_5", "narration_6", "narration_7", "narration_8",
+        "duration_1", "duration_2", "duration_3", "duration_4",
+        "duration_5", "duration_6", "duration_7", "duration_8",
+        "fingerprint", "status",
+    )
+    FUNCTION = "extract"
+    CATEGORY = "hyperpipeline/story_i2v"
+
+    def extract(self, approved_script_json, min_scene_seconds, max_scene_seconds, padding_seconds, words_per_minute):
+        script_data = _load_json_text(approved_script_json, "StoryNarrationPack")
+        scenes = script_data.get("scenes", [])
+        narrations = []
+        durations = []
+        for idx in range(8):
+            scene = scenes[idx] if idx < len(scenes) and isinstance(scenes[idx], dict) else {}
+            text = (scene.get("narration_ru") or "").strip()
+            narrations.append(text)
+            durations.append(
+                _estimate_narration_duration(
+                    text,
+                    min_seconds=int(min_scene_seconds),
+                    max_seconds=int(max_scene_seconds),
+                    padding_seconds=float(padding_seconds),
+                    words_per_minute=int(words_per_minute),
+                )
+            )
+        fingerprint = _fingerprint_text(
+            approved_script_json,
+            min_scene_seconds,
+            max_scene_seconds,
+            padding_seconds,
+            words_per_minute,
+            *narrations,
+            *durations,
+        )
+        status = " | ".join(f"{i+1}:{durations[i]}s" for i in range(8))
+        return (*narrations, *durations, fingerprint, status)
+
+
+class StoryCharacterSheetPromptNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "prompt_pack_json": ("STRING", {"default": "", "multiline": True}),
+                "character_bible_en": ("STRING", {"default": "", "multiline": True}),
+                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("character_sheet_prompt", "fingerprint")
+    FUNCTION = "build"
+    CATEGORY = "hyperpipeline/story_i2v"
+
+    def build(self, prompt_pack_json, character_bible_en, negative_prompt):
+        global_style = ""
+        if (prompt_pack_json or "").strip():
+            try:
+                pack = _load_json_text(prompt_pack_json, "StoryCharacterSheetPrompt")
+                global_style = pack.get("global_style_prompt", "")
+            except Exception:
+                global_style = ""
+        prompt = _join_prompt_parts(
+            "Create one clean character reference sheet for the story cast.",
+            character_bible_en,
+            "Show every recurring character full body, front view, neutral pose, consistent costume, plain light background.",
+            f"Global style: {global_style}." if global_style else "",
+            f"Avoid: {negative_prompt}." if negative_prompt else "",
+        )
+        return prompt, _fingerprint_text(prompt)
 
 
 class StoryVideoSettingsNode:
@@ -575,12 +763,12 @@ class StoryImageSettingsNode:
             "required": {
                 "api_provider": (["poyo", "atlascloud"], {"default": "atlascloud"}),
                 "api_key": ("STRING", {"default": "", "multiline": False}),
-                "text_to_image_model": ("STRING", {"default": "black-forest-labs/flux-1-schnell"}),
-                "image_edit_model": ("STRING", {"default": "black-forest-labs/flux-1-schnell"}),
+                "text_to_image_model": ("STRING", {"default": "black-forest-labs/flux-1-dev"}),
+                "image_edit_model": ("STRING", {"default": "black-forest-labs/flux-1-dev"}),
                 "output_size": (list(s.SIZE_MAP.keys()), {"default": "2K 9:16 1440x2560"}),
                 "grid_quality": (["low", "medium", "high"], {"default": "medium"}),
                 "scene_quality": (["low", "medium", "high"], {"default": "high"}),
-                "image_prompt_strength": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "image_prompt_strength": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01}),
             }
         }
 
@@ -616,7 +804,7 @@ class StoryImageSettingsNode:
         edit_model = (image_edit_model or "").strip()
         if provider == "atlascloud":
             if text_model in ("gpt-image-2", "gpt-image-2-edit", ""):
-                text_model = "black-forest-labs/flux-1-schnell"
+                text_model = "black-forest-labs/flux-1-dev"
             if edit_model in ("gpt-image-2", "gpt-image-2-edit", ""):
                 edit_model = text_model
         else:
@@ -673,7 +861,7 @@ class StoryScriptGenerator8Node:
                 "api_key": ("STRING", {"default": "", "multiline": False}),
                 "model": ("STRING", {"default": "gemini-2.5-flash"}),
                 "style_description": ("STRING", {"default": "cinematic 3D render, retro-futurism, glowing neon lights, highly detailed, octane render style", "multiline": True}),
-                "api_provider": (["poyo", "google_official"], {"default": "poyo"}),
+                "api_provider": (list(TEXT_API_PROVIDERS), {"default": "poyo"}),
                 "cache_name": ("STRING", {"default": "story_script_8"}),
                 "cache_mode": (["auto", "use cached", "regenerate"], {"default": "auto"}),
             }
@@ -710,7 +898,7 @@ class StoryScriptGenerator8Node:
     ):
         global SHARED_API_KEYS
         provider = (api_provider or "poyo").strip().lower()
-        if provider not in ("poyo", "google_official"):
+        if provider not in TEXT_API_PROVIDERS:
             provider = "poyo"
 
         if provider == "google_official":
@@ -722,6 +910,19 @@ class StoryScriptGenerator8Node:
                 or ""
             ).strip()
             missing_key_message = "Google/Gemini API key not found in env variables or inputs."
+        elif provider == "atlascloud":
+            key = (
+                api_key
+                or os.getenv("ATLAS_API_KEY")
+                or os.getenv("POYO_API_KEY")
+                or SHARED_API_KEYS["atlascloud"]
+                or SHARED_API_KEYS["poyo"]
+                or ""
+            ).strip()
+            missing_key_message = (
+                "Atlas/Poyo-compatible text API key not found. StoryScriptGenerator8 "
+                "currently routes atlascloud text requests through the Poyo Gemini-compatible endpoint."
+            )
         else:
             key = (api_key or os.getenv("POYO_API_KEY") or SHARED_API_KEYS["poyo"] or "").strip()
             missing_key_message = "Poyo API key not found in env variables or inputs."
@@ -1263,6 +1464,8 @@ NODE_CLASS_MAPPINGS = {
     "StoryRuScriptGeneratorNode": StoryRuScriptGeneratorNode,
     "StoryScriptApprovalNode": StoryScriptApprovalNode,
     "StoryEnPromptPackNode": StoryEnPromptPackNode,
+    "StoryNarrationPackNode": StoryNarrationPackNode,
+    "StoryCharacterSheetPromptNode": StoryCharacterSheetPromptNode,
     "StoryVideoSettingsNode": StoryVideoSettingsNode,
     "StoryImageSettingsNode": StoryImageSettingsNode,
     "StoryImageModelSwitchNode": StoryImageModelSwitchNode,
@@ -1278,6 +1481,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StoryRuScriptGeneratorNode": "RU Story Script Generator",
     "StoryScriptApprovalNode": "Approve / Edit RU Script",
     "StoryEnPromptPackNode": "EN Production Prompt Pack",
+    "StoryNarrationPackNode": "RU Narration + Timing Pack",
+    "StoryCharacterSheetPromptNode": "Character Sheet Prompt",
     "StoryVideoSettingsNode": "Story Video Settings",
     "StoryImageSettingsNode": "Story Image Settings",
     "StoryImageModelSwitchNode": "Story Image Model Switch",
@@ -1296,6 +1501,8 @@ class StoryI2vExtension(ComfyExtension):
             StoryRuScriptGeneratorNode,
             StoryScriptApprovalNode,
             StoryEnPromptPackNode,
+            StoryNarrationPackNode,
+            StoryCharacterSheetPromptNode,
             StoryVideoSettingsNode,
             StoryImageSettingsNode,
             StoryImageModelSwitchNode,

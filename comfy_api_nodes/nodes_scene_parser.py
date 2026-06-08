@@ -98,6 +98,15 @@ def _effective_cache_mode(mode: str, global_mode: str = "auto") -> str:
     return local if local in {"auto", "use cached", "regenerate"} else "auto"
 
 
+def _processor_cache_fingerprint(kind: str, explicit: str = "", **settings) -> str:
+    """Build a stable processor cache fingerprint when the graph does not wire one."""
+    if (explicit or "").strip():
+        return explicit
+    import json
+    payload = {"kind": kind, **settings}
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
 _VEO_PROMPT_MAX_CHARS = 950
 
 
@@ -5248,6 +5257,18 @@ class ViralSceneImageProcessorNode(IO.ComfyNode):
         
         import os
         effective_mode = _effective_cache_mode(mode, global_mode)
+        cache_fingerprint = _processor_cache_fingerprint(
+            "scene_image",
+            cache_fingerprint,
+            prompt=prompt,
+            api_provider=api_provider,
+            model=model,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            seed=seed,
+            image_prompt_strength=image_prompt_strength,
+        )
         path = ImageCacheNode._cache_path(cache_name)
         exists = os.path.exists(path)
         fingerprint_ok = ImageCacheNode._fingerprint_matches(cache_name, cache_fingerprint)
@@ -5287,8 +5308,20 @@ class ViralSceneImageProcessorNode(IO.ComfyNode):
             
         import os
         from comfy_api_nodes.nodes_poyo_ai import PoyoAIImageNode
-        
+
         effective_mode = _effective_cache_mode(mode, global_mode)
+        cache_fingerprint = _processor_cache_fingerprint(
+            "scene_image",
+            cache_fingerprint,
+            prompt=prompt,
+            api_provider=api_provider,
+            model=model,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            seed=seed,
+            image_prompt_strength=image_prompt_strength,
+        )
         path = ImageCacheNode._cache_path(cache_name)
         exists = os.path.exists(path)
         fingerprint_ok = ImageCacheNode._fingerprint_matches(cache_name, cache_fingerprint)
@@ -5407,6 +5440,19 @@ class ViralSceneVideoProcessorNode(IO.ComfyNode):
             
         import os
         effective_mode = _effective_cache_mode(mode, global_mode)
+        cache_fingerprint = _processor_cache_fingerprint(
+            "scene_video",
+            cache_fingerprint,
+            prompt=prompt,
+            api_provider=api_provider,
+            model=model,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            duration=duration,
+            generate_audio=generate_audio,
+            auto_upscale=auto_upscale,
+            seed=seed,
+        )
         path = VideoCacheNode._cache_path(cache_name)
         exists = os.path.exists(path)
         fingerprint_ok = VideoCacheNode._fingerprint_matches(cache_name, cache_fingerprint)
@@ -5450,8 +5496,21 @@ class ViralSceneVideoProcessorNode(IO.ComfyNode):
         import shutil
         from comfy_api_nodes.nodes_poyo_ai import PoyoAISeedanceVideoNode
         from comfy_api.latest import _input_impl as _ii
-        
+
         effective_mode = _effective_cache_mode(mode, global_mode)
+        cache_fingerprint = _processor_cache_fingerprint(
+            "scene_video",
+            cache_fingerprint,
+            prompt=prompt,
+            api_provider=api_provider,
+            model=model,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            duration=duration,
+            generate_audio=generate_audio,
+            auto_upscale=auto_upscale,
+            seed=seed,
+        )
         path = VideoCacheNode._cache_path(cache_name)
         exists = os.path.exists(path)
         fingerprint_ok = VideoCacheNode._fingerprint_matches(cache_name, cache_fingerprint)
@@ -5560,6 +5619,21 @@ class ViralSceneAudioProcessorNode(IO.ComfyNode):
             
         import os
         effective_mode = _effective_cache_mode(mode, global_mode)
+        cache_fingerprint = _processor_cache_fingerprint(
+            "scene_audio",
+            cache_fingerprint,
+            text=text,
+            engine=engine,
+            voice=voice,
+            model=model,
+            stability=stability,
+            similarity_boost=similarity_boost,
+            style=style,
+            speed=speed,
+            language_code=language_code,
+            custom_voice_id=custom_voice_id,
+            output_format=output_format,
+        )
         path = AudioCacheNode._cache_path(cache_name)
         exists = os.path.exists(path)
         fingerprint_ok = AudioCacheNode._fingerprint_matches(cache_name, cache_fingerprint)
@@ -5594,8 +5668,23 @@ class ViralSceneAudioProcessorNode(IO.ComfyNode):
             return IO.NodeOutput(None)
             
         import os
-        
+
         effective_mode = _effective_cache_mode(mode, global_mode)
+        cache_fingerprint = _processor_cache_fingerprint(
+            "scene_audio",
+            cache_fingerprint,
+            text=text,
+            engine=engine,
+            voice=voice,
+            model=model,
+            stability=stability,
+            similarity_boost=similarity_boost,
+            style=style,
+            speed=speed,
+            language_code=language_code,
+            custom_voice_id=custom_voice_id,
+            output_format=output_format,
+        )
         path = AudioCacheNode._cache_path(cache_name)
         exists = os.path.exists(path)
         fingerprint_ok = AudioCacheNode._fingerprint_matches(cache_name, cache_fingerprint)
@@ -5692,6 +5781,19 @@ class StorySceneVideoProcessorNode(IO.ComfyNode):
         
         import os
         effective_mode = _effective_cache_mode(mode, global_mode)
+        cache_fingerprint = _processor_cache_fingerprint(
+            "story_scene_video",
+            cache_fingerprint,
+            prompt=prompt,
+            api_provider=api_provider,
+            model=model,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            duration=duration,
+            generate_audio=generate_audio,
+            auto_upscale=auto_upscale,
+            seed=seed,
+        )
         path = VideoCacheNode._cache_path(cache_name)
         exists = os.path.exists(path)
         fingerprint_ok = VideoCacheNode._fingerprint_matches(cache_name, cache_fingerprint)
@@ -5736,8 +5838,21 @@ class StorySceneVideoProcessorNode(IO.ComfyNode):
         import shutil
         from comfy_api_nodes.nodes_poyo_ai import PoyoAISeedanceVideoNode
         from comfy_api.latest import _input_impl as _ii
-        
+
         effective_mode = _effective_cache_mode(mode, global_mode)
+        cache_fingerprint = _processor_cache_fingerprint(
+            "story_scene_video",
+            cache_fingerprint,
+            prompt=prompt,
+            api_provider=api_provider,
+            model=model,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            duration=duration,
+            generate_audio=generate_audio,
+            auto_upscale=auto_upscale,
+            seed=seed,
+        )
         path = VideoCacheNode._cache_path(cache_name)
         exists = os.path.exists(path)
         fingerprint_ok = VideoCacheNode._fingerprint_matches(cache_name, cache_fingerprint)
@@ -5856,6 +5971,18 @@ class StoryboardGridProcessorNode(IO.ComfyNode):
         
         import os
         effective_mode = _effective_cache_mode(mode, global_mode)
+        cache_fingerprint = _processor_cache_fingerprint(
+            "storyboard_grid",
+            cache_fingerprint,
+            prompt=prompt,
+            api_provider=api_provider,
+            model=model,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            seed=seed,
+            image_prompt_strength=image_prompt_strength,
+        )
         path = ImageCacheNode._cache_path(cache_name)
         exists = os.path.exists(path)
         fingerprint_ok = ImageCacheNode._fingerprint_matches(cache_name, cache_fingerprint)
@@ -5890,8 +6017,20 @@ class StoryboardGridProcessorNode(IO.ComfyNode):
             
         import os
         from comfy_api_nodes.nodes_poyo_ai import PoyoAIImageNode
-        
+
         effective_mode = _effective_cache_mode(mode, global_mode)
+        cache_fingerprint = _processor_cache_fingerprint(
+            "storyboard_grid",
+            cache_fingerprint,
+            prompt=prompt,
+            api_provider=api_provider,
+            model=model,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            quality=quality,
+            seed=seed,
+            image_prompt_strength=image_prompt_strength,
+        )
         path = ImageCacheNode._cache_path(cache_name)
         exists = os.path.exists(path)
         fingerprint_ok = ImageCacheNode._fingerprint_matches(cache_name, cache_fingerprint)
@@ -5986,7 +6125,7 @@ class GlobalAPIConfigNode(IO.ComfyNode):
                 IO.String.Input("api_key", default="", optional=True),
             ],
             outputs=[
-                IO.String.Output("api_provider", display_name="api_provider"),
+                IO.Combo.Output("api_provider", display_name="api_provider", options=["poyo", "atlascloud"]),
                 IO.String.Output("api_key", display_name="api_key"),
             ]
         )
