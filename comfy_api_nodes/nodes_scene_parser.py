@@ -3761,6 +3761,33 @@ class ExtractScriptHeaderNode(IO.ComfyNode):
         return IO.NodeOutput(m.group(1).strip() if m else "")
 
 
+# V2.3 — per-model video-prompt presets. Mirrors Story I2V's STORY_VIDEO_PROMPT_PRESETS.
+# Each family maps to (preferred safe camera when none is specified, short motion-discipline
+# note used only in the unstructured fallback). Kept deliberately light: BuildVeoPromptNode's
+# stabilizer already neutralizes most unsafe motion, so these only nudge per-model behavior.
+VIRAL_VIDEO_PROMPT_PRESETS = {
+    "kling":    ("slow dolly-in",   "one continuous physical action, first-frame faithful, no cuts or scene reset"),
+    "seedance": ("static lock-off", "simple continuous motion, clear START/ACTION/END, no complex choreography"),
+    "veo":      ("static lock-off", "single natural action, steady camera, no scene reset"),
+    "generic":  ("static lock-off", "continuous motion only, preserve identity and framing, no abrupt edits"),
+}
+
+
+def _video_model_family(video_model: str) -> str | None:
+    """Map a concrete video model id to a prompt-preset family. Empty => None (no preset)."""
+    m = (video_model or "").strip().lower()
+    if not m:
+        return None
+    if "kling" in m:
+        return "kling"
+    if "seedance" in m:
+        return "seedance"
+    if "veo" in m:
+        return "veo"
+    # luma / runway / hailuo / anything explicitly set falls back to generic discipline.
+    return "generic"
+
+
 class BuildVeoPromptNode(IO.ComfyNode):
     """Assemble a clean, conflict-free Veo/Seedance prompt for ONE scene.
 
@@ -3830,6 +3857,19 @@ class BuildVeoPromptNode(IO.ComfyNode):
                     default="480",
                     tooltip="Hard cap on output length (digits only). Veo limit is 1000; under 500 produces sharper video. Empty = default 480.",
                 ),
+                # Declared LAST so adding it never shifts existing widget indices in
+                # pre-existing graphs (the 6 BuildVeo nodes in viral_video_pipeline.json).
+                IO.String.Input(
+                    "video_model",
+                    multiline=False,
+                    default="",
+                    optional=True,
+                    tooltip=(
+                        "Target video model id (e.g. wire ViralAPIConfigNode.video_model here). "
+                        "Selects a per-model preset: kling / seedance / veo / generic. "
+                        "Empty = no preset, output unchanged."
+                    ),
+                ),
             ],
             outputs=[IO.String.Output(display_name="veo_prompt")],
         )
@@ -3837,7 +3877,7 @@ class BuildVeoPromptNode(IO.ComfyNode):
     @classmethod
     async def execute(cls, scene_number: int, video_prompt: str,
                       signature_object_bible: str = "", setting_short: str = "",
-                      max_chars=480) -> IO.NodeOutput:
+                      max_chars=480, video_model: str = "") -> IO.NodeOutput:
         # Be robust to empty / non-numeric max_chars coming from a workflow
         # JSON quirk (widget shifts when other widgets are converted to inputs).
         try:
@@ -3873,11 +3913,16 @@ class BuildVeoPromptNode(IO.ComfyNode):
         # Compose. If the prompt is structured, do not append extra unlabeled
         # sentences after ATMOSPHERE; that gets parsed as atmosphere and dilutes
         # the motion instruction. Keep identity/object state anchored in START.
+        family = _video_model_family(video_model)
         segs = _split_video_segments(vp)
         if segs:
             start = segs.get("START", "")
             if so_state and "signature object" not in start.lower():
                 segs["START"] = f"{start.rstrip(',')}, signature object {so_state}".strip(" ,")
+            # Per-model preset: only fill an ABSENT camera, using stabilizer-safe vocabulary,
+            # so a model that's set but already has a camera move is left untouched.
+            if family and not segs.get("CAMERA"):
+                segs["CAMERA"] = VIRAL_VIDEO_PROMPT_PRESETS[family][0]
             out = _stabilize_video_prompt(_join_video_segments(segs))
         else:
             parts = [vp.rstrip(".") + "."]
@@ -3885,6 +3930,8 @@ class BuildVeoPromptNode(IO.ComfyNode):
                 parts.append(f"Signature object state for this scene only: {so_state}.")
             if setting_short and len(vp) < 200:
                 parts.append(setting_short.rstrip(".") + ".")
+            if family:
+                parts.append(VIRAL_VIDEO_PROMPT_PRESETS[family][1].rstrip(".") + ".")
             out = _stabilize_video_prompt(" ".join(parts))
         if len(out) > max_chars:
             out = out[:max_chars].rsplit(" ", 1)[0] + "…"

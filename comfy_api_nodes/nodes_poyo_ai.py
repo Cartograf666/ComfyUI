@@ -846,11 +846,129 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
         return IO.NodeOutput(await download_url_to_video_output(result.data.files[0].file_url))
 
 
+# ── Central provider/model config (Viral pipeline V1.3 / V1.4) ───────────────────
+
+# Image-model presets surfaced as a single switch (V1.4). poyo entries are
+# gpt-image-* ; everything else is an Atlas Cloud model path.
+_IMAGE_MODELS = [
+    "gpt-image-2",                          # poyo  — text→image (current default)
+    "gpt-image-2-edit",                     # poyo  — image→image / edit
+    "black-forest-labs/flux-1-schnell",     # atlas — fast
+    "black-forest-labs/flux-1-dev",         # atlas — quality (used by Story I2V)
+    "black-forest-labs/flux-2-dev",         # atlas — Flux.2 Dev (blueprints)
+    "Qwen/Qwen-Image",                      # atlas — Qwen-Image (blueprints)
+]
+
+_POYO_IMAGE_MODELS = {"gpt-image-2", "gpt-image-2-edit"}
+_ATLAS_VIDEO_MODELS = {
+    "kling-v2.0", "kling-v1.5", "luma-ray-v2", "luma-ray-v1", "runway-gen3", "hailuo-v1.5",
+}
+_POYO_VIDEO_MODELS = {
+    "veo3.1-lite-official", "veo3.1-fast-official", "veo3.1-quality-official",
+    "veo3.1-lite", "veo3.1-fast", "veo3.1-quality", "seedance-2", "seedance-2-fast",
+}
+
+
+class ViralAPIConfigNode(IO.ComfyNode):
+    """Single source of truth for provider / key / image-model / video-model across the
+    Viral pipeline. Replaces the per-node widgets + scattered PrimitiveNodes so switching
+    provider (poyo ↔ atlascloud) or model for an A/B run is a one-node edit, not 14.
+
+    Output types are chosen to match the downstream Poyo nodes exactly:
+      api_provider → COMBO (PoyoAIImageNode/PoyoAISeedanceVideoNode api_provider widget)
+      api_key      → STRING
+      image_model  → STRING (PoyoAIImageNode.model is a free STRING widget)
+      video_model  → COMBO  (PoyoAISeedanceVideoNode.model is a Combo widget)
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="ViralAPIConfigNode",
+            display_name="Viral — API & Model Config",
+            category="poyo_ai/config",
+            description=(
+                "Central provider/key/model switch for the Viral pipeline. Wire its outputs "
+                "into every Poyo image/video node so provider and model are set in one place. "
+                "Model is normalized to the selected provider (e.g. picking a gpt-image model "
+                "while on atlascloud falls back to flux-1-schnell)."
+            ),
+            inputs=[
+                IO.Combo.Input(
+                    "api_provider",
+                    options=["poyo", "atlascloud"],
+                    default="poyo",
+                    tooltip="Provider used by every image and video node downstream.",
+                ),
+                IO.String.Input(
+                    "api_key",
+                    multiline=False,
+                    default="",
+                    optional=True,
+                    tooltip="API key (poyo or Atlas). Falls back to POYO_API_KEY/ATLAS_API_KEY env vars.",
+                ),
+                IO.Combo.Input(
+                    "image_model",
+                    options=_IMAGE_MODELS,
+                    default="gpt-image-2",
+                    tooltip="Image model preset. gpt-image-* → poyo, paths → Atlas Cloud.",
+                ),
+                IO.Combo.Input(
+                    "video_model",
+                    options=_VIDEO_MODELS,
+                    default="veo3.1-lite-official",
+                    tooltip="Video model preset. veo*/seedance* → poyo, kling/luma/runway/hailuo → Atlas.",
+                ),
+            ],
+            outputs=[
+                IO.Combo.Output("api_provider", display_name="api_provider", options=["poyo", "atlascloud"]),
+                IO.String.Output("api_key", display_name="api_key"),
+                IO.String.Output("image_model", display_name="image_model"),
+                IO.Combo.Output("video_model", display_name="video_model", options=_VIDEO_MODELS),
+                IO.String.Output("status", display_name="status"),
+                # STRING twin of video_model for nodes whose input is STRING (e.g.
+                # BuildVeoPromptNode.video_model) — a COMBO→STRING link would fail type-check.
+                IO.String.Output("video_model_text", display_name="video_model_text"),
+            ],
+        )
+
+    @classmethod
+    async def execute(
+        cls,
+        api_provider: str = "poyo",
+        api_key: str = "",
+        image_model: str = "gpt-image-2",
+        video_model: str = "veo3.1-lite-official",
+    ) -> IO.NodeOutput:
+        provider = (api_provider or "poyo").strip().lower()
+        if provider not in ("poyo", "atlascloud"):
+            provider = "poyo"
+        img = (image_model or "").strip()
+        vid = (video_model or "").strip()
+
+        # Coerce the model to one valid for the chosen provider so an A/B provider flip
+        # never leaves a node pointing at a model the provider can't serve.
+        if provider == "atlascloud":
+            if img in _POYO_IMAGE_MODELS or not img:
+                img = "black-forest-labs/flux-1-schnell"
+            if vid in _POYO_VIDEO_MODELS or not vid:
+                vid = "kling-v2.0"
+        else:  # poyo
+            if img not in _POYO_IMAGE_MODELS or not img:
+                img = "gpt-image-2"
+            if vid in _ATLAS_VIDEO_MODELS or not vid:
+                vid = "veo3.1-lite-official"
+
+        status = f"{provider} | image={img} | video={vid}"
+        print(f"[ViralAPIConfigNode] {status}", flush=True)
+        return IO.NodeOutput(provider, api_key, img, vid, status, vid)
+
+
 # ── Registration ───────────────────────────────────────────────────────────────
 
 class PoyoAIExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[IO.ComfyNode]]:
-        return [PoyoAIImageNode, PoyoAISeedanceVideoNode]
+        return [PoyoAIImageNode, PoyoAISeedanceVideoNode, ViralAPIConfigNode]
 
 
 async def comfy_entrypoint() -> PoyoAIExtension:
