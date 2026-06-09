@@ -929,13 +929,14 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
 _IMAGE_MODELS = [
     "gpt-image-2",                          # poyo  — text→image (current default)
     "gpt-image-2-edit",                     # poyo  — image→image / edit
+    "nano-banana",                          # poyo  — $0.025/gen (2026-06: дороже gpt-image-2 1K low)
     "black-forest-labs/flux-schnell",       # atlas — fast
     "black-forest-labs/flux-dev",           # atlas — quality (used by Story I2V)
     "black-forest-labs/flux-2-pro/text-to-image",  # atlas — Flux.2 (blueprints)
     "Qwen/Qwen-Image",                      # atlas — Qwen-Image (blueprints)
 ]
 
-_POYO_IMAGE_MODELS = {"gpt-image-2", "gpt-image-2-edit"}
+_POYO_IMAGE_MODELS = {"gpt-image-2", "gpt-image-2-edit", "nano-banana"}
 _ATLAS_VIDEO_MODELS = {
     "kling-v2.0", "kling-v1.5", "luma-ray-v2", "luma-ray-v1", "runway-gen3", "hailuo-v1.5",
 }
@@ -957,6 +958,15 @@ _POYO_TO_ATLAS_IMAGE = {
     "gpt-image-2-edit": "openai/gpt-image-2/edit",
 }
 _ATLAS_IMAGE_FALLBACK = "openai/gpt-image-2/text-to-image"
+
+# Draft/final tier presets (V: cost pass). draft overrides models with the cheapest
+# pair; final respects the user's image_model/video_model selection.
+# Cheapest pair per poyo.ai/pricing 2026-06-09: gpt-image-2 (1K low $0.010/gen,
+# дешевле nano-banana $0.025) + veo3.1-fast-official (720p no-audio $0.018/s).
+_QUALITY_TIERS = [
+    "final (use selected models)",
+    "draft (cheapest: gpt-image-2 + veo3.1-fast-official)",
+]
 
 
 class ViralAPIConfigNode(IO.ComfyNode):
@@ -1006,8 +1016,19 @@ class ViralAPIConfigNode(IO.ComfyNode):
                 IO.Combo.Input(
                     "video_model",
                     options=_VIDEO_MODELS,
-                    default="veo3.1-lite-official",
+                    default="veo3.1-fast-official",
                     tooltip="Video model preset. veo*/seedance* → poyo, kling/luma/runway/hailuo → Atlas.",
+                ),
+                IO.Combo.Input(
+                    "quality_tier",
+                    options=_QUALITY_TIERS,
+                    default=_QUALITY_TIERS[0],
+                    optional=True,
+                    tooltip=(
+                        "draft: ignore selected models and use the cheapest pair for the provider "
+                        "(poyo: nano-banana + veo3.1-fast-official; atlas: cheapest fallbacks). "
+                        "final: use the models selected above. Iterate on draft, render once on final."
+                    ),
                 ),
             ],
             outputs=[
@@ -1028,13 +1049,21 @@ class ViralAPIConfigNode(IO.ComfyNode):
         api_provider: str = "poyo",
         api_key: str = "",
         image_model: str = "gpt-image-2",
-        video_model: str = "veo3.1-lite-official",
+        video_model: str = "veo3.1-fast-official",
+        quality_tier: str = "",
     ) -> IO.NodeOutput:
         provider = (api_provider or "poyo").strip().lower()
         if provider not in ("poyo", "atlascloud"):
             provider = "poyo"
         img = (image_model or "").strip()
         vid = (video_model or "").strip()
+
+        # Draft tier: override with the cheapest known pair BEFORE provider coercion,
+        # so on atlas the coercion below still maps them to that provider's cheapest.
+        tier = "draft" if (quality_tier or "").strip().lower().startswith("draft") else "final"
+        if tier == "draft":
+            img = "gpt-image-2"
+            vid = "veo3.1-fast-official"
 
         # Coerce the model to one valid for the chosen provider so an A/B provider flip
         # never leaves a node pointing at a model the provider can't serve.
@@ -1051,7 +1080,7 @@ class ViralAPIConfigNode(IO.ComfyNode):
             if vid in _ATLAS_VIDEO_MODELS or not vid:
                 vid = "veo3.1-lite-official"
 
-        status = f"{provider} | image={img} | video={vid}"
+        status = f"{provider} | tier={tier} | image={img} | video={vid}"
         print(f"[ViralAPIConfigNode] {status}", flush=True)
         return IO.NodeOutput(provider, api_key, img, vid, status, vid)
 

@@ -3580,11 +3580,17 @@ class ManifestWriterNode(IO.ComfyNode):
 # Hardcoded prices per Poyo's public pricing page (USD).
 # Image: per-call. Video: per-second (or per-video for older veo3.1-* base models).
 # Update via the `refresh_prices` button on the CostTrackerNode (TODO).
+# Verified against poyo.ai/pricing 2026-06-09:
+#   - gpt-image-2 — это цены "Low quality" тиера; Medium заметно дороже (1K $0.042).
+#   - nano-banana подорожала до $0.025/gen (была $0.004) — дороже gpt-image-2 1K low.
+#   - veo3.1-*-official: цены ниже — БЕЗ аудио; с аудио fast 720p = $0.030/s,
+#     lite 720/1080p = $0.075/s (таблица аудио-вариант не моделирует).
+#   - seedance-2-fast на прайс-странице больше не значится — цена не подтверждена.
 _POYO_PRICES_USD = {
     "image": {
         "gpt-image-2":         {"1K": 0.010, "2K": 0.020, "4K": 0.040, "_unit": "per_call"},
         "gpt-image-2-edit":    {"1K": 0.030, "2K": 0.040, "4K": 0.060, "_unit": "per_call"},
-        "nano-banana":         {"1K": 0.004, "2K": 0.008, "4K": 0.016, "_unit": "per_call"},
+        "nano-banana":         {"1K": 0.025, "2K": 0.025, "4K": 0.025, "_unit": "per_call"},
     },
     "video": {
         # per_second pricing

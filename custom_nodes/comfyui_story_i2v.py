@@ -440,6 +440,8 @@ class StoryRuScriptGeneratorNode:
 - Сцен ровно столько, сколько просит пользователь.
 - Все персонажи должны сохранять одинаковую внешность во всех сценах.
 - Каждая сцена должна иметь конкретное действие, не статичную позу.
+- Сцена 1 — хук: первые 2 секунды должны создавать загадку или сильную эмоцию, останавливающую скролл; действие начинается мгновенно, без вступления.
+- Последняя сцена — луп: её финальное состояние визуально перекликается с открывающим кадром сцены 1 (то же место/ракурс), чтобы видео бесшовно зацикливалось при повторе, но при этом давало эмоциональную развязку.
 - Не используй английский язык в этом JSON."""
             user_prompt = (
                 f"Идея:\n{idea}\n\n"
@@ -720,7 +722,7 @@ class StoryVideoSettingsNode:
             "required": {
                 "api_provider": (["poyo", "atlascloud"], {"default": "atlascloud"}),
                 "api_key": ("STRING", {"default": "", "multiline": False}),
-                "video_model": ("STRING", {"default": "kling-v2.0"}),
+                "video_model": ("STRING", {"default": "bytedance/seedance-2.0-fast/image-to-video"}),
                 "output_size": (list(s.SIZE_MAP.keys()), {"default": "1080x1920 vertical"}),
                 "duration": ("INT", {"default": 6, "min": 4, "max": 15, "step": 1}),
             }
@@ -735,11 +737,13 @@ class StoryVideoSettingsNode:
         provider = (api_provider or "atlascloud").strip().lower()
         model = (video_model or "").strip()
         if provider == "atlascloud" and model in ("seedance-2", "seedance-2-fast", "veo3.1-lite-official", "veo3.1-fast-official", "veo3.1-quality-official", "veo3.1-lite", "veo3.1-fast", "veo3.1-quality"):
-            model = "kling-v2.0"
+            # Cheapest Atlas i2v until Phase 0 proves a pricier model is worth it
+            # (kling-v2.0 stays available when selected explicitly).
+            model = "bytedance/seedance-2.0-fast/image-to-video"
         elif provider == "poyo" and model in ("kling-v2.0", "kling-v1.5", "luma-ray-v2", "luma-ray-v1", "runway-gen3", "hailuo-v1.5"):
-            model = "seedance-2"
+            model = "seedance-2-fast"
         elif not model:
-            model = "kling-v2.0" if provider == "atlascloud" else "seedance-2"
+            model = "bytedance/seedance-2.0-fast/image-to-video" if provider == "atlascloud" else "seedance-2-fast"
         _image_resolution, video_resolution, aspect_ratio = self.SIZE_MAP.get(
             output_size,
             self.SIZE_MAP["1080x1920 vertical"],
