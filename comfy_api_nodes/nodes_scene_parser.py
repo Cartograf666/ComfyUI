@@ -627,6 +627,20 @@ class ApifyTrendAnalyzerNode(IO.ComfyNode):
 _APIFY_TERMINAL_STATES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT", "TIMED_OUT"}
 
 
+def _apify_cache_key(actor_path: str, query: str, results_limit: int, extra: str) -> str:
+    import hashlib
+    raw = f"{actor_path}|{query}|{int(results_limit)}|{(extra or '').strip()}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _apify_cache_path(key: str) -> str:
+    import os
+    import folder_paths
+    cache_dir = os.path.join(folder_paths.get_output_directory(), "apify_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"{key}.json")
+
+
 class ApifyActorRunNode(IO.ComfyNode):
     """Trigger an Apify actor with a search topic and wait for it to finish.
 
@@ -693,6 +707,18 @@ class ApifyActorRunNode(IO.ComfyNode):
                     tooltip="Give up polling after this many seconds (the run keeps going on Apify).",
                     advanced=True,
                 ),
+                IO.Combo.Input(
+                    "cache_mode",
+                    options=["auto", "use cached", "regenerate"],
+                    default="auto",
+                    optional=True,
+                    tooltip=(
+                        "auto = reuse a cached run_id for the same actor+query+limit, else run once and cache. "
+                        "use cached = only return the cached run_id (never call Apify). "
+                        "regenerate = always start a fresh run and overwrite the cache."
+                    ),
+                    advanced=True,
+                ),
             ],
             outputs=[
                 IO.String.Output("run_id", display_name="run_id"),
@@ -712,6 +738,7 @@ class ApifyActorRunNode(IO.ComfyNode):
         limit_field: str = "resultsPerPage",
         extra_input_json: str = "",
         max_wait_seconds: int = 240,
+        cache_mode: str = "auto",
     ) -> IO.NodeOutput:
         query = (search_query or "").strip()
         if not enabled or not query:
@@ -734,6 +761,26 @@ class ApifyActorRunNode(IO.ComfyNode):
             run_input[query_field.strip()] = [query]
         if limit_field.strip():
             run_input[limit_field.strip()] = int(results_limit)
+
+        # Cache: avoid re-running the (paid, slow) actor when the same actor+query+limit
+        # was already run. The cached run_id still resolves downstream as long as Apify
+        # retains that run's dataset.
+        import os
+        mode = (cache_mode or "auto").strip().lower()
+        cache_key = _apify_cache_key(actor_path, query, results_limit, extra)
+        cache_file = _apify_cache_path(cache_key)
+        if mode != "regenerate" and os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                cached = None
+            if cached and cached.get("run_id"):
+                print(f"[ApifyActorRun] cache HIT run_id={cached['run_id']} query={query!r} (mode={mode})", flush=True)
+                return IO.NodeOutput(cached["run_id"], f"Apify cache hit (run_id {cached['run_id']}, query: {query}).")
+        if mode == "use cached":
+            return IO.NodeOutput("", f"Apify cache miss for query {query!r} with mode='use cached' — run once with 'auto' or 'regenerate' first.")
+        print(f"[ApifyActorRun] cache MISS query={query!r} (mode={mode}) — starting actor run.", flush=True)
 
         headers = {"Authorization": f"Bearer {api_token.strip()}", "Content-Type": "application/json"}
         start_url = f"https://api.apify.com/v2/acts/{actor_path}/runs"
@@ -764,6 +811,13 @@ class ApifyActorRunNode(IO.ComfyNode):
             return IO.NodeOutput(run_id, f"Apify run still {status or 'RUNNING'} after {int(waited)}s — fetch may be empty until it finishes.")
         if status != "SUCCEEDED":
             return IO.NodeOutput(run_id, f"Apify run ended with status {status}.")
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump({"run_id": run_id, "query": query, "actor": actor_path,
+                           "results_limit": int(results_limit)}, f)
+            print(f"[ApifyActorRun] cached run_id={run_id} → {cache_file}", flush=True)
+        except OSError as exc:
+            print(f"[ApifyActorRun] cache write failed (non-fatal): {exc}", flush=True)
         return IO.NodeOutput(run_id, f"Apify run SUCCEEDED in ~{int(waited)}s (query: {query}).")
 
 
@@ -1178,6 +1232,49 @@ class AudioConcatNode(IO.ComfyNode):
 
         combined = torch.cat(waveforms, dim=-1)
         return IO.NodeOutput({"waveform": combined, "sample_rate": sample_rate})
+
+
+class SafePreviewAudioNode(IO.ComfyNode):
+    """Preview audio only when the global audio switch is enabled.
+
+    Unlike ComfyUI's built-in PreviewAudio, this node treats a disabled or missing
+    audio input as a no-op so video-only runs do not fail on None audio.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="SafePreviewAudioNode",
+            display_name="Safe Preview Audio (toggle-aware)",
+            category="viral_pipeline/audio",
+            inputs=[
+                IO.Boolean.Input(
+                    "enabled",
+                    default=True,
+                    tooltip="Off = do not request audio upstream and do not render a preview.",
+                ),
+                IO.Audio.Input(
+                    "audio",
+                    optional=True,
+                    lazy=True,
+                    tooltip="Audio to preview. Not requested while disabled.",
+                ),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def check_lazy_status(cls, enabled: bool, audio=None) -> list[str]:
+        if not enabled or audio is not None:
+            return []
+        return ["audio"]
+
+    @classmethod
+    def execute(cls, enabled: bool, audio=None) -> IO.NodeOutput:
+        if not enabled or audio is None:
+            return IO.NodeOutput()
+        from comfy_api.latest import UI
+        return IO.NodeOutput(ui=UI.PreviewAudio(audio, cls=cls))
 
 
 _EL_CONCURRENCY: asyncio.Semaphore | None = None
@@ -3805,7 +3902,7 @@ class BuildVeoPromptNode(IO.ComfyNode):
         the full bible (matched by "Scene N").
       • Append a short, single sentence of setting only if Video Prompt is
         short and lacks context — never the full Setting Bible verbatim.
-      • Hard cap output at ~480 chars (Veo cap is 1000, but shorter = sharper).
+      • Hard cap output near 900 chars by default (Veo cap is 1000; keep a small margin).
     """
 
     @classmethod
@@ -3834,6 +3931,12 @@ class BuildVeoPromptNode(IO.ComfyNode):
                     tooltip="The Video Prompt for THIS scene (from SceneParser.video_prompt_N).",
                 ),
                 IO.String.Input(
+                    "max_chars",
+                    multiline=False,
+                    default="900",
+                    tooltip="Hard cap on output length (digits only). Veo limit is 1000; empty = default 900.",
+                ),
+                IO.String.Input(
                     "signature_object_bible",
                     multiline=True,
                     default="",
@@ -3850,12 +3953,6 @@ class BuildVeoPromptNode(IO.ComfyNode):
                     default="",
                     optional=True,
                     tooltip="Optional 1-sentence setting hint (NOT the full Setting Bible). Only used if video_prompt < 200 chars.",
-                ),
-                IO.String.Input(
-                    "max_chars",
-                    multiline=False,
-                    default="480",
-                    tooltip="Hard cap on output length (digits only). Veo limit is 1000; under 500 produces sharper video. Empty = default 480.",
                 ),
                 # Declared LAST so adding it never shifts existing widget indices in
                 # pre-existing graphs (the 6 BuildVeo nodes in viral_video_pipeline.json).
@@ -3876,23 +3973,18 @@ class BuildVeoPromptNode(IO.ComfyNode):
 
     @classmethod
     async def execute(cls, scene_number: int, video_prompt: str,
-                      signature_object_bible: str = "", setting_short: str = "",
-                      max_chars=480, video_model: str = "") -> IO.NodeOutput:
+                      max_chars=900, signature_object_bible: str = "",
+                      setting_short: str = "", video_model: str = "") -> IO.NodeOutput:
         # Be robust to empty / non-numeric max_chars coming from a workflow
         # JSON quirk (widget shifts when other widgets are converted to inputs).
         try:
-            max_chars = int(str(max_chars).strip()) if str(max_chars).strip() else 480
+            max_chars = int(str(max_chars).strip()) if str(max_chars).strip() else 900
         except (ValueError, TypeError):
-            max_chars = 480
-        max_chars = max(200, min(900, max_chars))
+            max_chars = 900
+        max_chars = max(300, min(950, max_chars))
         import re
 
         vp = (video_prompt or "").strip()
-        if not vp:
-            raise ValueError(
-                f"BuildVeoPrompt: video_prompt is empty for scene {scene_number}. "
-                "Connect SceneParser.video_prompt_N to this node's video_prompt input."
-            )
 
         # Extract just this scene's signature-object state from the bible.
         # Bible lines typically look like: "Scene 1: burns brightly, Scene 2: flickers, ..."
@@ -3909,6 +4001,23 @@ class BuildVeoPromptNode(IO.ComfyNode):
                 m = re.search(pat2, bible, re.IGNORECASE)
             if m:
                 so_state = m.group(1).strip().rstrip(",.;")
+
+        if not vp:
+            fallback_parts = [
+                f"START: scene {scene_number} holds on the generated keyframe",
+                "ACTION: subtle natural motion only",
+                "END: composition remains stable",
+                "CAMERA: locked-off shot",
+                "ATMOSPHERE: consistent with the keyframe image",
+            ]
+            if setting_short:
+                fallback_parts.append(setting_short.rstrip("."))
+            vp = ". ".join(fallback_parts) + "."
+            print(
+                f"[BuildVeoPrompt] video_prompt is empty for scene {scene_number}; "
+                "using a conservative fallback prompt.",
+                flush=True,
+            )
 
         # Compose. If the prompt is structured, do not append extra unlabeled
         # sentences after ATMOSPHERE; that gets parsed as atmosphere and dilutes
@@ -4860,6 +4969,22 @@ def _parse_cast(script: str) -> list[tuple[int, str, str]]:
             name, desc = rest.split(",")[0].strip()[:40], rest
         cast.append((idx, name, desc))
     cast.sort(key=lambda t: t[0])
+    if cast:
+        return cast
+
+    # Current Viral scripts often emit a compact CHARACTER BIBLE instead of a
+    # numbered CAST section. Treat each sentence/semicolon clause as one reusable
+    # character reference, with a single-clause bible becoming CHARACTER 1.
+    bible = _parse_global_field(script, "CHARACTER BIBLE")
+    if bible:
+        chunks = [
+            c.strip()
+            for c in re.split(r"(?:\n+|;\s+|(?<=\.)\s+(?=[A-ZА-Я]))", bible)
+            if c.strip()
+        ]
+        for idx, desc in enumerate(chunks[:_MAX_CHARACTERS], start=1):
+            name = desc.split(",")[0].strip()[:40] or f"Character {idx}"
+            cast.append((idx, name, desc.rstrip(".")))
     return cast
 
 
@@ -6215,6 +6340,7 @@ class SceneParserExtension(ComfyExtension):
             SceneParserNode,
             VoiceoverRewriteApplyNode,
             AudioConcatNode,
+            SafePreviewAudioNode,
             StringGateNode,
             ImageGateNode,
             VideoGateNode,

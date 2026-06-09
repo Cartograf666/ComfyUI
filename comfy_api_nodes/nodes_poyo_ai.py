@@ -9,6 +9,7 @@ Upload:  POST https://api.poyo.ai/api/common/upload/base64
 import asyncio
 import hashlib
 import random
+import re
 
 import aiohttp
 
@@ -156,12 +157,52 @@ async def _upload_image_to_atlas(api_key: str, tensor) -> str:
                 )
             res_data = await resp.json()
 
-    url = res_data.get("url")
+    data_sec = res_data.get("data") if isinstance(res_data.get("data"), dict) else {}
+    url = (
+        data_sec.get("download_url")
+        or data_sec.get("url")
+        or res_data.get("download_url")
+        or res_data.get("url")
+    )
     if not url:
         raise Exception(f"Atlas Cloud AI upload returned no url in response: {str(res_data)[:300]}")
 
     _ATLAS_UPLOAD_CACHE[fp] = url
     return url
+
+
+def _atlas_size(aspect_ratio: str, model: str = "", target_pixels: int = 1024 * 1024) -> str:
+    """Atlas Cloud size string — format depends on the model.
+
+    gpt-image-* only accepts OpenAI's fixed set in 'WIDTHxHEIGHT' form
+    (1024x1024 / 1024x1536 / 1536x1024). Other models (flux, seedance) want
+    'WIDTH*HEIGHT' (regex ^\\d+\\*\\d+$) at ~1MP, multiple of 16. Converts a
+    'W:H' (or 'W*H') aspect ratio accordingly.
+    """
+    import math
+    ar = (aspect_ratio or "").strip()
+    m = re.fullmatch(r"(\d+)\s*[:x*/]\s*(\d+)", ar)
+    w_r, h_r = (int(m.group(1)), int(m.group(2))) if m else (1, 1)
+
+    if "gpt-image" in (model or ""):
+        if w_r == h_r:
+            return "1024x1024"
+        return "1024x1536" if h_r > w_r else "1536x1024"
+
+    scale = math.sqrt(target_pixels / (w_r * h_r))
+    w = max(256, round(w_r * scale / 16) * 16)
+    h = max(256, round(h_r * scale / 16) * 16)
+    return f"{w}*{h}"
+
+
+def _is_placeholder_ref(t) -> bool:
+    """True for the empty-character white 64x64 placeholder tile (see
+    ImageCacheNode._empty_character_placeholder). Such a tile is meaningless as
+    an image reference, so it must not be uploaded or trigger an edit model."""
+    try:
+        return tuple(t.shape[-3:-1]) == (64, 64) and float(t.min()) > 0.99
+    except Exception:
+        return False
 
 
 async def _submit_and_poll_atlas(
@@ -196,6 +237,17 @@ async def _submit_and_poll_atlas(
     poll_interval = 5.0
     elapsed = 0.0
     max_timeout = max(300.0, float(estimated_duration * 3))
+    try:
+        import os
+        env_timeout = float(os.getenv("ATLAS_MAX_TIMEOUT_SECONDS", "").strip() or 0)
+    except ValueError:
+        env_timeout = 0.0
+    if env_timeout > 0:
+        max_timeout = max(max_timeout, env_timeout)
+    print(
+        f"[Atlas Cloud] Submitted task {prediction_id}; polling up to {int(max_timeout)}s.",
+        flush=True,
+    )
     
     while elapsed < max_timeout:
         try:
@@ -429,15 +481,20 @@ class PoyoAIImageNode(IO.ComfyNode):
                         "edit mode."
                     ),
                 ),
-                IO.Float.Input(
+                # Declared as String (not Float) and coerced in execute(). The seed's
+                # control_after_generate widget injects an extra value ("randomize" /
+                # a random int) right before this field; on any widget-order drift that
+                # value lands here. A strict Float input would fail PROMPT VALIDATION for
+                # the WHOLE graph ("could not convert string to float: 'randomize'") before
+                # any node runs. A String input accepts anything and execute() coerces it,
+                # so this field can never abort the prompt again. Mirrors BuildVeoPrompt.max_chars.
+                IO.String.Input(
                     "image_prompt_strength",
-                    default=0.1,
-                    min=0.0,
-                    max=1.0,
-                    step=0.01,
+                    multiline=False,
+                    default="0.1",
                     tooltip=(
-                        "How strongly the reference image(s) influence the output (edit mode only). "
-                        "Applies to the whole edit request."
+                        "How strongly the reference image(s) influence the output (edit mode only, 0.0-1.0). "
+                        "Applies to the whole edit request. Invalid or out-of-range values fall back to 0.1."
                     ),
                     advanced=True,
                 ),
@@ -449,17 +506,27 @@ class PoyoAIImageNode(IO.ComfyNode):
     async def execute(
         cls,
         api_key: str,
+        api_provider: str,
         model: str,
         prompt: str,
         aspect_ratio: str,
         quality: str,
         resolution: str,
         seed: int,
-        image_prompt_strength: float = 0.1,
-        base_scene_image=None,
         reference_image=None,
-        api_provider: str = "poyo",
+        base_scene_image=None,
+        image_prompt_strength="0.1",
     ) -> IO.NodeOutput:
+        # image_prompt_strength may arrive as a stray control word ("randomize"),
+        # an out-of-range int, or "" when a workflow's widget order drifts. Coerce
+        # defensively so the field never breaks the run; out-of-range -> default.
+        try:
+            image_prompt_strength = float(str(image_prompt_strength).strip())
+        except (ValueError, TypeError):
+            image_prompt_strength = 0.1
+        if not (0.0 <= image_prompt_strength <= 1.0):
+            image_prompt_strength = 0.1
+
         if not prompt.strip():
             print("[PoyoAIImageNode] Image generation skipped because prompt is empty.", flush=True)
             return IO.NodeOutput(block_execution=None)
@@ -478,19 +545,29 @@ class PoyoAIImageNode(IO.ComfyNode):
         api_key = key
         validate_string(prompt, strip_whitespace=True, min_length=1, field_name="prompt")
 
+        usable_refs = [t for t in (base_scene_image, reference_image) if t is not None and not _is_placeholder_ref(t)]
+        print(f"[PoyoAIImageNode] execute START provider={api_provider!r} model={model.strip()!r} "
+              f"usable_refs={len(usable_refs)} aspect={aspect_ratio} prompt_chars={len(prompt.strip())} "
+              f"prompt[:60]={prompt.strip()[:60]!r}", flush=True)
+
         if api_provider == "atlascloud":
             submit_url = "https://api.atlascloud.ai/api/v1/model/generateImage"
             image_urls: list[str] | None = None
-            refs = [t for t in (base_scene_image, reference_image) if t is not None]
+            # Drop the empty-character placeholder so it never becomes a reference.
+            refs = list(usable_refs)
+            effective_model = model.strip()
+            # gpt-image text→image can't take an image; switch to its edit model when
+            # a real reference is present.
+            if refs and effective_model == "openai/gpt-image-2/text-to-image":
+                effective_model = "openai/gpt-image-2/edit"
             if refs:
                 image_urls = [await _upload_image_to_atlas(api_key, t) for t in refs]
-            
+
             effective_seed = seed if seed > 0 else random.randint(1, 2147483647)
             payload = {
-                "model": model.strip(),
+                "model": effective_model,
                 "prompt": prompt,
-                "aspect_ratio": aspect_ratio,
-                "size": aspect_ratio,
+                "size": _atlas_size(aspect_ratio, effective_model),
                 "seed": effective_seed,
             }
             if image_urls:
@@ -507,7 +584,7 @@ class PoyoAIImageNode(IO.ComfyNode):
 
         # Reference images, in request order: the base scene (establishing plate) is the primary
         # canvas to edit, the character sheet follows as an identity reference. Either may be absent.
-        refs = [t for t in (base_scene_image, reference_image) if t is not None]
+        refs = list(usable_refs)
         if refs:
             if "edit" not in effective_model:
                 effective_model = "gpt-image-2-edit"
@@ -742,8 +819,7 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
             payload = {
                 "model": model.strip(),
                 "prompt": prompt,
-                "aspect_ratio": aspect_ratio,
-                "size": aspect_ratio,
+                "size": _atlas_size(aspect_ratio),
                 "seed": effective_seed,
                 "duration": duration,
             }
@@ -757,7 +833,7 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
                     payload["start_image"] = image_urls[0]
                     payload["end_image"] = image_urls[1]
             
-            outputs = await _submit_and_poll_atlas(api_key, submit_url, payload, estimated_duration=duration * 20)
+            outputs = await _submit_and_poll_atlas(api_key, submit_url, payload, estimated_duration=duration * 60)
             return IO.NodeOutput(await download_url_to_video_output(outputs[0]))
 
         # Per-model validation — fail fast with a useful message instead of burning credits on a 400.
@@ -853,9 +929,9 @@ class PoyoAISeedanceVideoNode(IO.ComfyNode):
 _IMAGE_MODELS = [
     "gpt-image-2",                          # poyo  — text→image (current default)
     "gpt-image-2-edit",                     # poyo  — image→image / edit
-    "black-forest-labs/flux-1-schnell",     # atlas — fast
-    "black-forest-labs/flux-1-dev",         # atlas — quality (used by Story I2V)
-    "black-forest-labs/flux-2-dev",         # atlas — Flux.2 Dev (blueprints)
+    "black-forest-labs/flux-schnell",       # atlas — fast
+    "black-forest-labs/flux-dev",           # atlas — quality (used by Story I2V)
+    "black-forest-labs/flux-2-pro/text-to-image",  # atlas — Flux.2 (blueprints)
     "Qwen/Qwen-Image",                      # atlas — Qwen-Image (blueprints)
 ]
 
@@ -867,6 +943,20 @@ _POYO_VIDEO_MODELS = {
     "veo3.1-lite-official", "veo3.1-fast-official", "veo3.1-quality-official",
     "veo3.1-lite", "veo3.1-fast", "veo3.1-quality", "seedance-2", "seedance-2-fast",
 }
+
+# Friendly poyo video names → real Atlas Cloud image-to-video model ids.
+_POYO_TO_ATLAS_VIDEO = {
+    "seedance-2-fast": "bytedance/seedance-2.0-fast/image-to-video",
+    "seedance-2": "bytedance/seedance-2.0/image-to-video",
+}
+_ATLAS_VIDEO_FALLBACK = "bytedance/seedance-2.0-fast/image-to-video"
+
+# Friendly poyo image names → real Atlas Cloud image model ids.
+_POYO_TO_ATLAS_IMAGE = {
+    "gpt-image-2": "openai/gpt-image-2/text-to-image",
+    "gpt-image-2-edit": "openai/gpt-image-2/edit",
+}
+_ATLAS_IMAGE_FALLBACK = "openai/gpt-image-2/text-to-image"
 
 
 class ViralAPIConfigNode(IO.ComfyNode):
@@ -949,10 +1039,12 @@ class ViralAPIConfigNode(IO.ComfyNode):
         # Coerce the model to one valid for the chosen provider so an A/B provider flip
         # never leaves a node pointing at a model the provider can't serve.
         if provider == "atlascloud":
+            img = _POYO_TO_ATLAS_IMAGE.get(img, img)
             if img in _POYO_IMAGE_MODELS or not img:
-                img = "black-forest-labs/flux-1-schnell"
+                img = _ATLAS_IMAGE_FALLBACK
+            vid = _POYO_TO_ATLAS_VIDEO.get(vid, vid)
             if vid in _POYO_VIDEO_MODELS or not vid:
-                vid = "kling-v2.0"
+                vid = _ATLAS_VIDEO_FALLBACK
         else:  # poyo
             if img not in _POYO_IMAGE_MODELS or not img:
                 img = "gpt-image-2"

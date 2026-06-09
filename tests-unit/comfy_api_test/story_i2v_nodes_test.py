@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import inspect
 
 import pytest
 
@@ -13,7 +14,9 @@ from comfy.cli_args import args
 args.cpu = True
 
 import custom_nodes.comfyui_story_i2v as story
+from comfy_api_nodes.nodes_poyo_ai import PoyoAIImageNode
 from comfy_api_nodes.nodes_scene_parser import _processor_cache_fingerprint
+from comfy_api_nodes.nodes_scene_parser import BuildVeoPromptNode
 from comfy_api_nodes.nodes_scene_parser import StorySceneVideoProcessorNode
 from comfy_api_nodes.nodes_scene_parser import StoryboardGridProcessorNode
 from comfy_api_nodes.nodes_scene_parser import ViralSceneImageProcessorNode
@@ -142,6 +145,17 @@ def _schema_inputs(node_cls):
     return {item.id: item for item in node_cls.define_schema().inputs}
 
 
+def test_poyo_image_execute_signature_matches_schema_order():
+    schema_names = [item.id for item in PoyoAIImageNode.define_schema().inputs]
+    execute_names = [
+        name
+        for name in inspect.signature(PoyoAIImageNode.execute).parameters
+        if name != "cls"
+    ]
+
+    assert execute_names == schema_names
+
+
 def test_story_i2v_processor_defaults_are_practical_not_phase0_placeholders():
     scene_image = _schema_inputs(ViralSceneImageProcessorNode)
     grid = _schema_inputs(StoryboardGridProcessorNode)
@@ -162,3 +176,20 @@ def test_story_concat_supports_optional_background_music():
 
     assert "background_music" in inputs
     assert inputs["background_music_volume"].default == 0.08
+
+
+@pytest.mark.asyncio
+async def test_build_veo_prompt_uses_stable_fallback_when_video_prompt_empty():
+    out = await BuildVeoPromptNode.execute(
+        scene_number=2,
+        video_prompt="",
+        signature_object_bible="Scene 2: flickers with a blue pulse.",
+        setting_short="Inside a quiet neon hallway.",
+        video_model="seedance-2",
+    )
+
+    prompt = out[0]
+    assert "START:" in prompt
+    assert "scene 2" in prompt
+    assert "CAMERA:" in prompt
+    assert "flickers with a blue pulse" in prompt
