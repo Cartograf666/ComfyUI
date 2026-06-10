@@ -438,8 +438,11 @@ class StoryRuScriptGeneratorNode:
 }
 Правила:
 - Сцен ровно столько, сколько просит пользователь.
-- Все персонажи должны сохранять одинаковую внешность во всех сценах.
-- Каждая сцена должна иметь конкретное действие, не статичную позу.
+- Все персонажи должны сохранять одинаковую внешность во всех сценах; character_bible_ru задаёт конкретику: цвета, одежда, причёска, телосложение, один отличительный аксессуар на персонажа.
+- В каждой сцене ровно ОДНО простое видимое действие одного персонажа (present continuous по смыслу) — без монтажа, без параллельных действий нескольких персонажей: несколько движущихся субъектов — главная причина деформаций в видео.
+- История должна быть полностью понятна БЕЗ звука: каждый бит — видимое действие и видимая реакция в кадре.
+- Каждая сцена происходит ИЗ-ЗА предыдущей (причинность, а не «и потом»); ставки растут от сцены к сцене.
+- narration_ru: максимум 12 слов (≈5 секунд озвучки), простая разговорная фраза, описывающая происходящее на экране; если наррация не нужна — пустая строка. Длина наррации управляет длительностью сцены, не превышай лимит.
 - Сцена 1 — хук: первые 2 секунды должны создавать загадку или сильную эмоцию, останавливающую скролл; действие начинается мгновенно, без вступления.
 - Последняя сцена — луп: её финальное состояние визуально перекликается с открывающим кадром сцены 1 (то же место/ракурс), чтобы видео бесшовно зацикливалось при повторе, но при этом давало эмоциональную развязку.
 - Не используй английский язык в этом JSON."""
@@ -537,7 +540,7 @@ class StoryEnPromptPackNode:
         pack = None if mode == "regenerate" else _read_cached_json(cache_name, fingerprint, mode, "StoryEnPromptPack")
         if pack is None:
             script_data = _load_json_text(approved_script_json, "StoryEnPromptPack input")
-            system_instruction = """You are a production prompt engineer for AI image/video generation.
+            system_instruction = """You are a production prompt engineer for AI image/video generation. Each scene becomes (a) one keyframe image generated from image_prompt - it is Frame 0 of the clip; (b) a 5-6 second video animated from that keyframe using video_prompt. Image-to-video models are fragile: simple staging, ONE action per scene.
 Convert the Russian story JSON into a compact English production prompt pack.
 Return only JSON with this exact structure:
 {
@@ -548,16 +551,23 @@ Return only JSON with this exact structure:
   "scenes": [
     {
       "scene_index": 1,
-      "image_prompt": "English keyframe prompt with style, characters, setting, composition",
-      "video_prompt": "English video prompt with concrete action, camera movement, continuity constraints, anti-deformation constraints"
+      "image_prompt": "English keyframe prompt",
+      "video_prompt": "English video prompt"
     }
   ]
 }
-Rules:
-- Keep prompts concise but specific.
-- Preserve the same characters across every scene.
-- Each video_prompt must describe a clear action and camera movement.
-- Add stability instructions: stable identity, consistent costume, no limb distortion.
+Rules for image_prompt (ONE line, 60-120 words):
+- It is FRAME 0: describe the starting pose BEFORE the action, never mid-action or the climax ("crouches at the rim, looking down", not "touches the crystal") - if the still shows the climax, the video has nothing to animate.
+- Open with this scene's specific setup; the first 15 words must be UNIQUE per scene, never character boilerplate (identical openings produce near-identical images).
+- Then: short inline character reminder, a setting fragment, 3-5 atmosphere details unique to this moment, one emotional beat word (curious/cautious/awed/defiant/triumphant), shot type (close-up/medium/wide) + camera angle (low/eye-level/overhead).
+- Keep the main subject large and centered; never an extreme-wide shot with tiny characters.
+Rules for video_prompt (ONE line, max 700 characters, five labelled segments in this order):
+"START: [what Frame 0 shows, matches image_prompt] ACTION: [ONE physical change across 5 seconds, present continuous, ONE subject moving - no montage, no 'and then', no multi-character choreography] END: [final pose/state the next scene picks up] CAMERA: [exactly one of: static lock-off, slow dolly-in, slow dolly-out, slow push-in, slow pull-back, tracking left, tracking right] ATMOSPHERE: [one lighting or particle detail]"
+General rules:
+- Banned words everywhere: cinematic, epic, stunning, breathtaking, atmospheric, dynamic, vibrant, high-energy, suddenly, rapidly, instantly, fast-paced.
+- Preserve identical character wording across all scenes (reuse character_bible_en phrasing).
+- Do not duplicate global_style_prompt or character_bible_en inside image_prompt/video_prompt - they are appended downstream automatically.
+- storyboard_grid_prompt: one sheet, exactly N numbered panels, same style and characters in every panel, one panel per scene's key moment.
 - Do not include Russian text in generated prompts."""
             raw_text = _story_model_call(
                 api_provider,
