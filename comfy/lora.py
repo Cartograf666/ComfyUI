@@ -304,6 +304,13 @@ def model_lora_keys_unet(model, key_map={}):
                     key_map["lycoris_{}".format(key_lora.replace(".", "_"))] = k #SimpleTuner lycoris format
                     key_map["transformer.{}".format(key_lora)] = k #SimpleTuner regular format
 
+    if isinstance(model, comfy.model_base.HiDreamO1):
+        for k in sdk:
+            if k.startswith("diffusion_model."):
+                if k.endswith(".weight"):
+                    key_lora = k[len("diffusion_model."):-len(".weight")]
+                    key_map["model.{}".format(key_lora)] = k
+
     if isinstance(model, comfy.model_base.ACEStep):
         for k in sdk:
             if k.startswith("diffusion_model.") and k.endswith(".weight"): #Official ACE step lora format
@@ -325,6 +332,17 @@ def model_lora_keys_unet(model, key_map={}):
                 # Support transformer prefix format
                 key_map["transformer.{}".format(key_lora)] = k
                 key_map["lycoris_{}".format(key_lora.replace(".", "_"))] = k #SimpleTuner lycoris format
+
+    if isinstance(model, comfy.model_base.Krea2):
+        diffusers_keys = comfy.utils.krea2_to_diffusers(model.model_config.unet_config, output_prefix="diffusion_model.")
+        for k in diffusers_keys:
+            if k.endswith(".weight"):
+                to = diffusers_keys[k]
+                key_lora = k[:-len(".weight")]
+                key_map["diffusion_model.{}".format(key_lora)] = to
+                key_map["transformer.{}".format(key_lora)] = to
+                key_map["lycoris_{}".format(key_lora.replace(".", "_"))] = to
+                key_map[key_lora] = to
 
     if isinstance(model, comfy.model_base.Lumina2):
         diffusers_keys = comfy.utils.z_image_to_diffusers(model.model_config.unet_config, output_prefix="diffusion_model.")
@@ -356,6 +374,18 @@ def model_lora_keys_unet(model, key_map={}):
             if k.startswith("diffusion_model.") and k.endswith(".weight"):
                 key_lora = k[len("diffusion_model."):-len(".weight")]
                 key_map["transformer.{}".format(key_lora)] = k
+
+    if isinstance(model, (comfy.model_base.LTXV, comfy.model_base.LTXAV)):
+        for k in sdk:
+            if k.startswith("diffusion_model.") and k.endswith(".weight"):
+                key_lora = k[len("diffusion_model."):-len(".weight")]
+                key_map["{}".format(key_lora)] = k
+
+    if isinstance(model, comfy.model_base.MiniMaxH3):
+        for k in sdk:
+            if k.startswith("diffusion_model.") and k.endswith(".weight"):
+                key_lora = k[len("diffusion_model."):-len(".weight")]
+                key_map[key_lora] = k
 
     return key_map
 
