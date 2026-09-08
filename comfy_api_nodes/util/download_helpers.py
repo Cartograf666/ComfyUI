@@ -17,7 +17,7 @@ from folder_paths import get_output_directory
 from . import request_logger
 from ._helpers import (
     default_base_url,
-    get_auth_header,
+    get_comfy_api_headers,
     is_processing_interrupted,
     sleep_with_interrupt,
     to_aiohttp_url,
@@ -38,6 +38,7 @@ async def download_url_to_bytesio(
     retry_delay: float = 1.0,
     retry_backoff: float = 2.0,
     cls: type[COMFY_IO.ComfyNode] = None,
+    allow_redirects: bool = True,
 ) -> None:
     """Stream-download a URL to `dest`.
 
@@ -48,6 +49,10 @@ async def download_url_to_bytesio(
 
     If `url` starts with `/proxy/`, `cls` must be provided so the URL can be expanded
     to an absolute URL and authentication headers can be applied.
+
+    Pass `allow_redirects=False` when the caller has already vetted `url` and a
+    redirect would move the download somewhere it did not vet. The default keeps
+    aiohttp's redirect following.
 
     Raises:
         ProcessingInterrupted, LocalNetworkError, ApiServerError, Exception (HTTP and other errors)
@@ -64,10 +69,15 @@ async def download_url_to_bytesio(
         if cls is None:
             raise ValueError("For relative 'cloud' paths, the `cls` parameter is required.")
         url = urljoin(default_base_url().rstrip("/") + "/", url.lstrip("/"))
-        headers = get_auth_header(cls)
+        headers = get_comfy_api_headers(cls)
 
     while True:
         attempt += 1
+        # A retry re-reads from byte zero, so a part-filled BytesIO must be emptied
+        # or the two bodies concatenate.
+        if isinstance(dest, BytesIO):
+            dest.seek(0)
+            dest.truncate(0)
         op_id = _generate_operation_id("GET", url, attempt)
         timeout_cfg = aiohttp.ClientTimeout(total=timeout)
 
@@ -96,7 +106,9 @@ async def download_url_to_bytesio(
 
             monitor_task = asyncio.create_task(_monitor())
 
-            req_task = asyncio.create_task(session.get(to_aiohttp_url(url), headers=headers))
+            req_task = asyncio.create_task(
+                session.get(to_aiohttp_url(url), headers=headers, allow_redirects=allow_redirects)
+            )
             done, pending = await asyncio.wait({req_task, monitor_task}, return_when=asyncio.FIRST_COMPLETED)
 
             if monitor_task in done and req_task in pending:
@@ -111,7 +123,9 @@ async def download_url_to_bytesio(
                 raise ProcessingInterrupted("Task cancelled") from None
 
             async with resp:
-                if resp.status >= 400:
+                # Under allow_redirects=False a redirect lands here unfollowed, and its
+                # body is not the file that was asked for.
+                if resp.status >= 300:
                     with contextlib.suppress(Exception):
                         try:
                             body = await resp.json()
@@ -221,10 +235,11 @@ async def download_url_to_image_tensor(
     *,
     timeout: float = None,
     cls: type[COMFY_IO.ComfyNode] = None,
+    allow_redirects: bool = True,
 ) -> torch.Tensor:
     """Downloads an image from a URL and returns a [B, H, W, C] tensor."""
     result = BytesIO()
-    await download_url_to_bytesio(url, result, timeout=timeout, cls=cls)
+    await download_url_to_bytesio(url, result, timeout=timeout, cls=cls, allow_redirects=allow_redirects)
     return bytesio_to_image_tensor(result)
 
 
@@ -234,10 +249,18 @@ async def download_url_to_video_output(
     timeout: float = None,
     max_retries: int = 5,
     cls: type[COMFY_IO.ComfyNode] = None,
+    allow_redirects: bool = True,
 ) -> InputImpl.VideoFromFile:
     """Downloads a video from a URL and returns a `VIDEO` output."""
     result = BytesIO()
-    await download_url_to_bytesio(video_url, result, timeout=timeout, max_retries=max_retries, cls=cls)
+    await download_url_to_bytesio(
+        video_url,
+        result,
+        timeout=timeout,
+        max_retries=max_retries,
+        cls=cls,
+        allow_redirects=allow_redirects,
+    )
     return InputImpl.VideoFromFile(result)
 
 
@@ -270,6 +293,7 @@ async def download_url_to_file_3d(
     timeout: float | None = None,
     max_retries: int = 5,
     cls: type[COMFY_IO.ComfyNode] = None,
+    allow_redirects: bool = True,
 ) -> Types.File3D:
     """Downloads a 3D model file from a URL into memory as BytesIO.
 
@@ -284,6 +308,7 @@ async def download_url_to_file_3d(
         timeout=timeout,
         max_retries=max_retries,
         cls=cls,
+        allow_redirects=allow_redirects,
     )
 
     if task_id is not None:
